@@ -1,41 +1,31 @@
 # ================================================================
-# Kokoro-Mamba Pro PEFT 项目 - 配置文件
+# Kokoro-Mamba Pro PEFT 项目 - 最终配置文件
 # ================================================================
-# 这就是你的指挥中心。所有的实验参数都在这里定义。
+# 存放于项目根目录 kokoro/config.yaml
 
 # --- 1. 路径配置 (Paths) ---
-# 请根据你的本地环境，修改下面的路径
 paths:
   repo_id: "hexgrad/Kokoro-82M-v1.1-zh"
-  # 原始 AISHELL-3 数据
+  # 以下路径相对于项目根目录 (kokoro/)
   aishell3_tar: "./train.tar.gz" 
   aishell3_content: "./AISHELL-3/train/content.txt"
-  # 预处理后的数据存放位置
   processed_data: "./AISHELL-3-processed"
-  # 模型权重输出目录
   output_dir: "./kokoro_finetuned_model_4070L"
-  # (可选) 第二阶段微调时，加载第一阶段的 Mamba 权重
-  load_mamba_from: null # 例如: "./kokoro_finetuned_model_4070L/mamba_peft_epoch_10.pth"
+  load_mamba_from: null
 
 # --- 2. 数据处理配置 (Data Processing) ---
 data:
-  # 使用 100% 的全量数据
   sampling_ratio: 1.0
-  # 模型期望的最终音频采样率
   target_sample_rate: 24000
 
 # --- 3. 训练配置 (Training) ---
 training:
-  # 你的 4070L 只有 8G 显存，batch_size 必须调小！
-  # 这是一个保守的起始值，如果 OOM (显存溢出)，就再调小一点，比如 2。
+  # 4070 Laptop 8G 显存的保守设置
   batch_size: 4
   epochs: 50
   learning_rate: 1e-4
-  # 自动混合精度 (AMP) 对 30/40 系显卡有奇效，必须开启
   use_amp: true
-  # 每隔多少个 epoch 保存一次权重
   save_every_n_epochs: 5
-  # Dataloader 使用的 CPU 核心数
   num_workers: 4
 
 # --- 4. Mamba 模型配置 (Mamba Model) ---

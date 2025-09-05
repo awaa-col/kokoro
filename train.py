@@ -1,7 +1,7 @@
 import argparse
 import torch
 import torchaudio
-import yaml # <-- 新增：用于读取配置文件
+import yaml
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from mamba_ssm import Mamba
@@ -12,16 +12,16 @@ import tarfile
 import random
 
 # --- 导入 Kokoro 核心组件 ---
-from kokoro.kokoro.model import KModel
-from kokoro.kokoro.pipeline import KPipeline
-from kokoro.kokoro.modules import DurationEncoder
+# 注意：这里的导入路径已经根据脚本的新位置进行了修正
+from kokoro.model import KModel
+from kokoro.pipeline import KPipeline
+from kokoro.modules import DurationEncoder
 
-# =================================================================================
-# 核心逻辑区：这些函数现在都从 config 对象里读取参数
-# =================================================================================
+# ================================================================
+# 核心逻辑区
+# ================================================================
 
 def prepare_aishell3_dataset(config: dict):
-    """流式数据预处理"""
     tar_path = config['paths']['aishell3_tar']
     content_path = config['paths']['aishell3_content']
     output_path = config['paths']['processed_data']
@@ -34,7 +34,7 @@ def prepare_aishell3_dataset(config: dict):
     transcript_dict = {}
     if not Path(content_path).exists():
         print(f"错误: 找不到 content.txt: {content_path}")
-        print("请先解压: tar -xvf {tar_path} AISHELL-3/train/content.txt")
+        print(f"请先解压: tar -xvf {tar_path} AISHELL-3/train/content.txt")
         return False
     with open(content_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -65,7 +65,6 @@ def prepare_aishell3_dataset(config: dict):
     return True
 
 class CustomAudioDataset(Dataset):
-    """自适应采样率的数据集"""
     def __init__(self, data_path: str, target_sr: int):
         self.data_path = Path(data_path)
         self.wav_files = list(self.data_path.glob("*.wav"))
@@ -86,7 +85,6 @@ class CustomAudioDataset(Dataset):
         return {"text": text, "wav": wav.squeeze(0)}
 
 class Collator:
-    """数据整理器"""
     def __init__(self, pipeline: KPipeline): self.pipeline = pipeline
     def __call__(self, batch: List[dict]):
         batch = [item for item in batch if item is not None]
@@ -102,7 +100,6 @@ class Collator:
         return {"input_ids": input_ids_padded, "ref_s": ref_s, "mel_targets": mel_padded}
 
 def replace_lstm_with_mamba_in_durationencoder(duration_encoder: DurationEncoder, mamba_config: dict):
-    """模型手术"""
     sty_dim, d_model = duration_encoder.sty_dim, duration_encoder.d_model
     mamba_module = Mamba(
         d_model=d_model + sty_dim, 
@@ -121,8 +118,6 @@ def replace_lstm_with_mamba_in_durationencoder(duration_encoder: DurationEncoder
     return duration_encoder
 
 def adapt_model_for_finetuning(model: KModel):
-    """修改模型 forward 以支持训练"""
-    # (此函数内部逻辑复杂且与配置无关，保持原样)
     original_forward = model.forward_with_tokens
     def training_forward(self, input_ids, ref_s, speed=1, return_mel=False):
         if not return_mel: return original_forward(input_ids, ref_s, speed)
@@ -153,7 +148,6 @@ def adapt_model_for_finetuning(model: KModel):
     return model
 
 def setup_peft(model: KModel):
-    """设置 PEFT"""
     for param in model.parameters(): param.requires_grad = False
     for param in model.predictor.text_encoder.lstms[0].parameters(): param.requires_grad = True
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -161,20 +155,15 @@ def setup_peft(model: KModel):
     return model
     
 def train(config: dict):
-    """主训练循环"""
-    # --- 1. 自动预处理数据 ---
-    processed_data_dir = Path(config['paths']['processed_data'])
-    if not processed_data_dir.exists() or not any(processed_data_dir.iterdir()):
+    if not (Path(config['paths']['processed_data']).exists() and any(Path(config['paths']['processed_data']).iterdir())):
         if not prepare_aishell3_dataset(config): return
 
-    # --- 2. 初始化 ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")
     
     model = KModel(repo_id=config['paths']['repo_id'])
     pipeline = KPipeline(model=model)
     
-    # --- 3. 模型设置 ---
     model.predictor.text_encoder = replace_lstm_with_mamba_in_durationencoder(model.predictor.text_encoder, config['mamba'])
     if config['paths']['load_mamba_from']:
         try:
@@ -186,7 +175,6 @@ def train(config: dict):
     model = setup_peft(model)
     model.to(device)
     
-    # --- 4. 数据加载 ---
     dataset = CustomAudioDataset(config['paths']['processed_data'], target_sr=config['data']['target_sample_rate'])
     collator = Collator(pipeline)
     dataloader = DataLoader(
@@ -198,12 +186,10 @@ def train(config: dict):
         pin_memory=True
     )
     
-    # --- 5. 训练组件 ---
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['training']['learning_rate'])
     loss_fn = torch.nn.L1Loss()
     scaler = torch.cuda.amp.GradScaler(enabled=(config['training']['use_amp'] and device.type == 'cuda'))
     
-    # --- 6. 训练循环 ---
     print("="*50, "\n训练开始！\n", "="*50)
     for epoch in range(config['training']['epochs']):
         model.train()
@@ -213,9 +199,7 @@ def train(config: dict):
             if batch is None: continue
             optimizer.zero_grad(set_to_none=True)
             
-            input_ids = batch['input_ids'].to(device)
-            ref_s = batch['ref_s'].to(device)
-            mel_targets = batch['mel_targets'].to(device)
+            input_ids, ref_s, mel_targets = batch['input_ids'].to(device), batch['ref_s'].to(device), batch['mel_targets'].to(device)
             
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(config['training']['use_amp'] and device.type == 'cuda')):
                 predicted_mel, _, _ = model.forward_with_tokens(input_ids, ref_s, return_mel=True)
@@ -243,7 +227,11 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, required=True, help='指向 config.yaml 文件的路径')
     args = parser.parse_args()
     
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"错误: 找不到配置文件: {args.config}")
+        exit(1)
         
     train(config)
