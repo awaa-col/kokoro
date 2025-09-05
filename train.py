@@ -8,11 +8,9 @@ from mamba_ssm import Mamba
 from typing import List
 from pathlib import Path
 from tqdm import tqdm
-import tarfile
-import random
+import shutil
 
 # --- 导入 Kokoro 核心组件 ---
-# 注意：这里的导入路径已经根据脚本的新位置进行了修正
 from kokoro.model import KModel
 from kokoro.pipeline import KPipeline
 from kokoro.modules import DurationEncoder
@@ -21,21 +19,25 @@ from kokoro.modules import DurationEncoder
 # 核心逻辑区
 # ================================================================
 
-def prepare_aishell3_dataset(config: dict):
-    tar_path = config['paths']['aishell3_tar']
-    content_path = config['paths']['aishell3_content']
-    output_path = config['paths']['processed_data']
-    sampling_ratio = config['data']['sampling_ratio']
+def prepare_aishell3_dataset_from_unzipped(config: dict):
+    """
+    【最终版 v2.0】从一个完整解压的 AISHELL-3 目录创建训练集。
+    """
+    # 【升级】现在从一个根目录读取路径
+    unzipped_dir = Path(config['paths']['aishell3_unzipped_train_dir'])
+    content_path = unzipped_dir / "content.txt"
+    wav_root_path = unzipped_dir / "wav"
+    output_path = Path(config['paths']['processed_data'])
     
-    print("="*50, "\n开始流式数据预处理...")
-    output_dir = Path(output_path)
-    output_dir.mkdir(exist_ok=True)
+    print("="*50, "\n开始从已解压目录进行数据预处理...")
+    output_path.mkdir(exist_ok=True)
     
-    transcript_dict = {}
-    if not Path(content_path).exists():
-        print(f"错误: 找不到 content.txt: {content_path}")
-        print(f"请先解压: tar -xvf {tar_path} AISHELL-3/train/content.txt")
+    if not unzipped_dir.exists():
+        print(f"错误: 找不到 AISHELL-3 的训练目录: {unzipped_dir}")
+        print("请确保你已经将 train.tar.gz 完整解压，并正确配置了 config.yaml 中的路径。")
         return False
+        
+    transcript_dict = {}
     with open(content_path, 'r', encoding='utf-8') as f:
         for line in f:
             try:
@@ -43,24 +45,22 @@ def prepare_aishell3_dataset(config: dict):
                 transcript_dict[wav_name.strip()] = text.strip()
             except ValueError: continue
     
-    if sampling_ratio < 1.0: print(f"警告：将只处理 {sampling_ratio*100:.0f}% 的数据。")
+    print(f"标注文件加载完毕，共 {len(transcript_dict)} 条记录。")
 
-    try:
-        with tarfile.open(tar_path, "r:gz") as tar:
-            members = tar.getmembers()
-            for member in tqdm(members, desc="正在处理文件"):
-                if random.random() > sampling_ratio: continue
-                if member.isfile() and member.name.endswith(".wav"):
-                    wav_filename = Path(member.name).name
-                    text = transcript_dict.get(wav_filename)
-                    if text:
-                        txt_filepath = output_dir / f"{wav_filename.split('.')[0]}.txt"
-                        with open(txt_filepath, 'w', encoding='utf-8') as f_txt: f_txt.write(text)
-                        member.name = wav_filename
-                        tar.extract(member, path=output_dir)
-    except FileNotFoundError:
-        print(f"错误: 找不到 tar 文件: {tar_path}")
-        return False
+    all_wav_files = list(wav_root_path.glob("*/*.wav"))
+    for src_wav_path in tqdm(all_wav_files, desc="正在整理文件"):
+        wav_filename = src_wav_path.name
+        text = transcript_dict.get(wav_filename)
+        
+        if text:
+            txt_filename = wav_filename.replace(".wav", ".txt")
+            txt_filepath = output_path / txt_filename
+            with open(txt_filepath, 'w', encoding='utf-8') as f_txt:
+                f_txt.write(text)
+            
+            dest_wav_path = output_path / wav_filename
+            shutil.copy(src_wav_path, dest_wav_path)
+
     print("="*50, "\n数据预处理完成！\n", "="*50)
     return True
 
@@ -101,12 +101,7 @@ class Collator:
 
 def replace_lstm_with_mamba_in_durationencoder(duration_encoder: DurationEncoder, mamba_config: dict):
     sty_dim, d_model = duration_encoder.sty_dim, duration_encoder.d_model
-    mamba_module = Mamba(
-        d_model=d_model + sty_dim, 
-        d_state=mamba_config['d_state'], 
-        d_conv=mamba_config['d_conv'], 
-        expand=mamba_config['expand']
-    )
+    mamba_module = Mamba(d_model=d_model + sty_dim, d_state=mamba_config['d_state'], d_conv=mamba_config['d_conv'], expand=mamba_config['expand'])
     duration_encoder.lstms = torch.nn.ModuleList([mamba_module])
     def mamba_forward(self, x, style, text_lengths, m):
         s = style.expand(x.shape[0], x.shape[1], -1)
@@ -156,7 +151,7 @@ def setup_peft(model: KModel):
     
 def train(config: dict):
     if not (Path(config['paths']['processed_data']).exists() and any(Path(config['paths']['processed_data']).iterdir())):
-        if not prepare_aishell3_dataset(config): return
+        if not prepare_aishell3_dataset_from_unzipped(config): return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")

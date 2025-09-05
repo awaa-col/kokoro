@@ -1,21 +1,24 @@
 # ================================================================
-# Kokoro-Mamba Pro PEFT 项目 - 最终配置文件
+# Kokoro-Mamba Pro PEFT 项目 - 最终配置文件 (v2.0)
 # ================================================================
-# 存放于项目根目录 kokoro/config.yaml
+# 这是最终的、与 train.py 完全同步的配置文件。
 
 # --- 1. 路径配置 (Paths) ---
 paths:
   repo_id: "hexgrad/Kokoro-82M-v1.1-zh"
-  # 以下路径相对于项目根目录 (kokoro/)
-  aishell3_tar: "./train.tar.gz" 
-  aishell3_content: "./AISHELL-3/train/content.txt"
+  # 【重要】这里现在指向你完整解压后的 AISHELL-3 train 文件夹
+  aishell3_unzipped_train_dir: "./AISHELL-3/train"
+  # 预处理后的数据存放位置
   processed_data: "./AISHELL-3-processed"
+  # 模型权重输出目录
   output_dir: "./kokoro_finetuned_model_4070L"
+  # (可选) 第二阶段微调时，加载第一阶段的 Mamba 权重
   load_mamba_from: null
 
 # --- 2. 数据处理配置 (Data Processing) ---
 data:
-  sampling_ratio: 1.0
+  # 使用 100% 的全量数据
+  sampling_ratio: 1.0 # (此参数在当前模式下无效，但保留)
   target_sample_rate: 24000
 
 # --- 3. 训练配置 (Training) ---
