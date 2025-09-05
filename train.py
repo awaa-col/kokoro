@@ -245,38 +245,58 @@ def train(config: dict):
                 pin_memory=True
             )
             
-            # 【v3.3 升级】为专业样本生成做准备
+            # 【v3.4 终极升级】引入“模式开关”，让验证系统适应不同训练阶段
             sample_output_dir = Path(config['paths']['output_dir']) / "samples"
             sample_output_dir.mkdir(exist_ok=True, parents=True)
             
-            # 准备固定的参考音色
-            fixed_ref_s = None
+            # 模式一：专才培养 (指定了固定的参考音频)
             ref_wav_path_str = config.get('evaluation', {}).get('reference_wav_path', "")
-            if ref_wav_path_str:
+            if ref_wav_path_str and Path(ref_wav_path_str).exists():
+                print("检测到固定参考音频，进入“专才培养”验证模式。")
+                
+                # 1. 准备固定的参考音色
                 ref_wav_path = Path(ref_wav_path_str)
-                if ref_wav_path.exists():
-                    print(f"将使用固定参考音频进行样本生成: {ref_wav_path}")
-                    wav, sr = torchaudio.load(ref_wav_path)
-                    # 确保参考音频也是正确的采样率
-                    if sr != config['data']['target_sample_rate']:
-                        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=config['data']['target_sample_rate'])
-                        wav = resampler(wav)
-                    fixed_ref_s = pipeline.model.audio_to_ref_s(wav).to(device)
-                else:
-                    print(f"警告: 指定的参考音频路径不存在: {ref_wav_path}。将退回使用验证集中的随机参考音色。")
-            
-            # 如果没有指定固定音色，就从验证集里取一个
-            if fixed_ref_s is None:
-                print("将使用验证集中的第一个样本作为随机参考音色。")
-                sample_generation_batch = next(iter(val_dataloader))
-                fixed_ref_s = sample_generation_batch['ref_s'][:1].to(device)
+                wav, sr = torchaudio.load(ref_wav_path)
+                if sr != config['data']['target_sample_rate']:
+                    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=config['data']['target_sample_rate'])
+                    wav = resampler(wav)
+                fixed_ref_s = pipeline.model.audio_to_ref_s(wav).to(device)
 
-            # 准备固定的生成文本
-            sentences_to_generate = config.get('evaluation', {}).get('sentences_to_generate', [])
-            if not sentences_to_generate:
-                print("警告: 未在配置文件中指定用于生成的句子。将退回使用验证集中的随机文本。")
-                # 如果没指定句子，就用随机参考音色对应的那个句子
-                sentences_to_generate = [next(iter(val_dataset))['text']]
+                # 2. 准备固定的生成文本
+                sentences_to_generate = config.get('evaluation', {}).get('sentences_to_generate', [])
+                if not sentences_to_generate: # 如果没指定句子，就用一个默认的
+                    sentences_to_generate = ["你好，这是一个使用固定参考音色生成的样本。"]
+                
+                # 3. 定义样本生成逻辑
+                def generate_samples(epoch):
+                    print("正在生成“固定靶”音频样本...")
+                    with torch.no_grad():
+                        for i, sentence in enumerate(sentences_to_generate):
+                            phonemes = pipeline.g2p(sentence)[0]
+                            input_ids = torch.LongTensor([0, *list(filter(None, map(pipeline.model.vocab.get, phonemes))), 0]).unsqueeze(0).to(device)
+                            output_wav = model.forward_with_tokens(input_ids, fixed_ref_s)
+                            sample_path = sample_output_dir / f"epoch_{epoch+1}_sample_{i+1}.wav"
+                            torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
+
+            # 模式二：通才培养 (未指定参考音频)
+            else:
+                print("未检测到固定参考音频，进入“通才培养”验证模式。")
+                if ref_wav_path_str: # 路径填了但文件不存在
+                    print(f"警告: 指定的参考音频路径不存在: {ref_wav_path_str}")
+                
+                # 1. 从验证集中获取一个固定的批次用于随机试听
+                sample_generation_batch = next(iter(val_dataloader))
+                sample_input_ids = sample_generation_batch['input_ids'].to(device)
+                sample_ref_s = sample_generation_batch['ref_s'].to(device)
+                
+                # 2. 定义样本生成逻辑
+                def generate_samples(epoch):
+                    print("正在生成“随机靶”音频样本...")
+                    with torch.no_grad():
+                        # 只生成第一个样本以节省时间，但每次epoch的音色和文本是固定的（来自那个固定的batch）
+                        output_wav = model.forward_with_tokens(sample_input_ids[:1], sample_ref_s[:1])
+                        sample_path = sample_output_dir / f"epoch_{epoch+1}_random_sample.wav"
+                        torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
 
 
     dataloader = DataLoader(
@@ -341,23 +361,10 @@ def train(config: dict):
             avg_val_loss = val_loss / len(val_dataloader)
             print(f"Epoch {epoch+1} 验证完成，平均损失: {avg_val_loss:.4f}")
 
-            # 【v3.3 升级】使用专业级的样本生成逻辑
-            print("正在生成音频样本...")
-            with torch.no_grad():
-                for i, sentence in enumerate(sentences_to_generate):
-                    # 1. 文本转音素
-                    phonemes = pipeline.g2p(sentence)[0]
-                    input_ids = torch.LongTensor([0, *list(filter(None, map(pipeline.model.vocab.get, phonemes))), 0]).unsqueeze(0).to(device)
-                    
-                    # 2. 使用固定的参考音色进行合成
-                    output_wav = model.forward_with_tokens(input_ids, fixed_ref_s)
-                    
-                    # 3. 保存音频
-                    sample_path = sample_output_dir / f"epoch_{epoch+1}_sample_{i+1}.wav"
-                    torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
-            
-            print(f"音频样本已保存至: {sample_output_dir}")
-
+            # 【v3.4 终极升级】调用在上面定义的样本生成函数
+            if 'generate_samples' in locals():
+                generate_samples(epoch)
+                print(f"音频样本已保存至: {sample_output_dir}")
 
         if (epoch + 1) % config['training']['save_every_n_epochs'] == 0:
             output_path = Path(config['paths']['output_dir'])

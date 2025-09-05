@@ -1,129 +1,117 @@
-# kokoro
+# Kokoro-Mamba PEFT 语音克隆与有声书演播项目 - **最终交接文档**
 
-An inference library for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M). You can [`pip install kokoro`](https://pypi.org/project/kokoro/).
+---
 
-> **Kokoro** is an open-weight TTS model with 82 million parameters. Despite its lightweight architecture, it delivers comparable quality to larger models while being significantly faster and more cost-efficient. With Apache-licensed weights, Kokoro can be deployed anywhere from production environments to personal projects.
+## 1. 项目哲学与最终目标
 
-### Usage
-You can run this basic cell on [Google Colab](https://colab.research.google.com/). [Listen to samples](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/SAMPLES.md).
-```py
-!pip install -q kokoro>=0.9.4 soundfile
-!apt-get -qq -y install espeak-ng > /dev/null 2>&1
-from kokoro import KPipeline
-from IPython.display import display, Audio
-import soundfile as sf
-import torch
-pipeline = KPipeline(lang_code='a')
-text = '''
-[Kokoro](/kˈOkəɹO/) is an open-weight TTS model with 82 million parameters. Despite its lightweight architecture, it delivers comparable quality to larger models while being significantly faster and more cost-efficient. With Apache-licensed weights, [Kokoro](/kˈOkəɹO/) can be deployed anywhere from production environments to personal projects.
-'''
-generator = pipeline(text, voice='af_heart')
-for i, (gs, ps, audio) in enumerate(generator):
-    print(i, gs, ps)
-    display(Audio(data=audio, rate=24000, autoplay=i==0))
-    sf.write(f'{i}.wav', audio, 24000)
-```
-Under the hood, `kokoro` uses [`misaki`](https://pypi.org/project/misaki/), a G2P library at https://github.com/hexgrad/misaki
+我们项目的核心目标是训练一个**讲话自然的、可用于专业有声书演播的、同时支持高质量少样本语音克隆**的中文语音合成模型。
 
-### Advanced Usage
-You can run this advanced cell on [Google Colab](https://colab.research.google.com/).
-```py
-# 1️⃣ Install kokoro
-!pip install -q kokoro>=0.9.4 soundfile
-# 2️⃣ Install espeak, used for English OOD fallback and some non-English languages
-!apt-get -qq -y install espeak-ng > /dev/null 2>&1
+这个目标的确立，经历了从“探索 LNN/Mamba 可能性” -> “实现通用声音克隆” -> “聚焦于有声书级别的自然韵律”的演进。最终，我们确立了以下核心训练哲学：
 
-# 3️⃣ Initalize a pipeline
-from kokoro import KPipeline
-from IPython.display import display, Audio
-import soundfile as sf
-import torch
-# 🇺🇸 'a' => American English, 🇬🇧 'b' => British English
-# 🇪🇸 'e' => Spanish es
-# 🇫🇷 'f' => French fr-fr
-# 🇮🇳 'h' => Hindi hi
-# 🇮🇹 'i' => Italian it
-# 🇯🇵 'j' => Japanese: pip install misaki[ja]
-# 🇧🇷 'p' => Brazilian Portuguese pt-br
-# 🇨🇳 'z' => Mandarin Chinese: pip install misaki[zh]
-pipeline = KPipeline(lang_code='a') # <= make sure lang_code matches voice, reference above.
+1.  **先博学，后专精 (Two-Stage Fine-tuning)**: 我们坚信，一个优秀的语音克隆模型，不能是“一张白纸”。它必须首先在一个大规模、多说话人的通用数据集（如 AISHELL-3）上，学习什么是“自然的中文”，掌握语言的底层韵律规律。在这个“通才”的基础上，我们再用目标说话人的高质量数据（如有声书），对其进行“专才”培养，让它专注于模仿特定音色和叙事风格。
+2.  **微创手术，而非器官移植 (PEFT with Mamba)**: 我们选择用现代化的 Mamba 架构，去替换原始 Kokoro 模型中陈旧的 LSTM 模块。但这并非全盘否定，而是通过参数高效微调（PEFT）技术，在保留原始模型 99% 预训练知识的前提下，为其植入一颗更强大的“韵律处理心脏”。
+3.  **数据决定上限，模型逼近上限**: 我们承认，任何模型的表现，其天花板都由数据的质量和多样性决定。因此，我们的整个工作流，都围绕着如何高效、鲁棒地处理和利用数据来构建。
 
-# This text is for demonstration purposes only, unseen during training
-text = '''
-The sky above the port was the color of television, tuned to a dead channel.
-"It's not like I'm using," Case heard someone say, as he shouldered his way through the crowd around the door of the Chat. "It's like my body's developed this massive drug deficiency."
-It was a Sprawl voice and a Sprawl joke. The Chatsubo was a bar for professional expatriates; you could drink there for a week and never hear two words in Japanese.
+---
 
-These were to have an enormous impact, not only because they were associated with Constantine, but also because, as in so many other areas, the decisions taken by Constantine (or in his name) were to have great significance for centuries to come. One of the main issues was the shape that Christian churches were to take, since there was not, apparently, a tradition of monumental church buildings when Constantine decided to help the Christian church build a series of truly spectacular structures. The main form that these churches took was that of the basilica, a multipurpose rectangular structure, based ultimately on the earlier Greek stoa, which could be found in most of the great cities of the empire. Christianity, unlike classical polytheism, needed a large interior space for the celebration of its religious services, and the basilica aptly filled that need. We naturally do not know the degree to which the emperor was involved in the design of new churches, but it is tempting to connect this with the secular basilica that Constantine completed in the Roman forum (the so-called Basilica of Maxentius) and the one he probably built in Trier, in connection with his residence in the city at a time when he was still caesar.
+## 2. 架构总览
 
-[Kokoro](/kˈOkəɹO/) is an open-weight TTS model with 82 million parameters. Despite its lightweight architecture, it delivers comparable quality to larger models while being significantly faster and more cost-efficient. With Apache-licensed weights, [Kokoro](/kˈOkəɹO/) can be deployed anywhere from production environments to personal projects.
-'''
-# text = '「もしおれがただ偶然、そしてこうしようというつもりでなくここに立っているのなら、ちょっとばかり絶望するところだな」と、そんなことが彼の頭に思い浮かんだ。'
-# text = '中國人民不信邪也不怕邪，不惹事也不怕事，任何外國不要指望我們會拿自己的核心利益做交易，不要指望我們會吞下損害我國主權、安全、發展利益的苦果！'
-# text = 'Los partidos políticos tradicionales compiten con los populismos y los movimientos asamblearios.'
-# text = 'Le dromadaire resplendissant déambulait tranquillement dans les méandres en mastiquant de petites feuilles vernissées.'
-# text = 'ट्रांसपोर्टरों की हड़ताल लगातार पांचवें दिन जारी, दिसंबर से इलेक्ट्रॉनिक टोल कलेक्शनल सिस्टम'
-# text = "Allora cominciava l'insonnia, o un dormiveglia peggiore dell'insonnia, che talvolta assumeva i caratteri dell'incubo."
-# text = 'Elabora relatórios de acompanhamento cronológico para as diferentes unidades do Departamento que propõem contratos.'
+本项目基于 `hexgrad/Kokoro-82M` 模型。其核心改进点在于：
 
-# 4️⃣ Generate, display, and save audio files in a loop.
-generator = pipeline(
-    text, voice='af_heart', # <= change voice here
-    speed=1, split_pattern=r'\n+'
-)
-# Alternatively, load voice tensor directly:
-# voice_tensor = torch.load('path/to/voice.pt', weights_only=True)
-# generator = pipeline(
-#     text, voice=voice_tensor,
-#     speed=1, split_pattern=r'\n+'
-# )
+- **韵律建模升级**: 将核心韵律预测模块 `DurationEncoder` 内部的 `LSTM` 替换为 `Mamba` 状态空间模型，以期获得更强的长序列时序信息建模能力。
+- **参数高效**: 采用 PEFT 策略，在训练中冻结了除 Mamba 模块外的所有参数，极大地降低了训练所需的计算资源和时间，并有效防止了灾难性遗忘。
+- **配置文件驱动**: 所有的路径、超参数和实验设置，都由一个独立的 `config.yaml` 文件管理，实现了代码与配置的完全分离，保证了实验的可复现性和易用性。
 
-for i, (gs, ps, audio) in enumerate(generator):
-    print(i)  # i => index
-    print(gs) # gs => graphemes/text
-    print(ps) # ps => phonemes
-    display(Audio(data=audio, rate=24000, autoplay=i==0))
-    sf.write(f'{i}.wav', audio, 24000) # save each audio file
-```
+---
 
-### Windows Installation
-To install espeak-ng on Windows:
-1. Go to [espeak-ng releases](https://github.com/espeak-ng/espeak-ng/releases)
-2. Click on **Latest release** 
-3. Download the appropriate `*.msi` file (e.g. **espeak-ng-20191129-b702b03-x64.msi**)
-4. Run the downloaded installer
+## 3. 环境搭建 (WSL2)
 
-For advanced configuration and usage on Windows, see the [official espeak-ng Windows guide](https://github.com/espeak-ng/espeak-ng/blob/master/docs/guide.md)
+本项目**强依赖** Linux 环境进行编译和训练。对于 Windows 用户，**必须使用 WSL2**。
 
-### MacOS Apple Silicon GPU Acceleration
+1.  **安装 WSL2**: 以管理员身份打开 PowerShell, 运行 `wsl --install` 并安装 Ubuntu 发行版。
+2.  **安装 NVIDIA 驱动**: 在 **Windows** 端，确保安装了最新的、支持 WSL 的 NVIDIA 显卡驱动。
+3.  **克隆/迁移项目**: **将整个 `kokoro` 项目文件夹，完整地复制到 WSL 的 Linux 文件系统内部** (例如 `~/kokoro`)。**绝对不要**通过 `/mnt/` 路径从 Linux 访问 Windows 上的文件，这会导致灾难性的 I/O 性能瓶颈。
+4.  **安装依赖**: 在 WSL 的项目根目录 (`~/kokoro`) 下，执行：
+    ```bash
+    # 建议创建一个 conda 或 venv 虚拟环境
+    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+    pip install pyyaml tqdm transformers mamba-ssm causal-conv1d
+    ```
 
-On Mac M1/M2/M3/M4 devices, you can explicitly specify the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` to enable GPU acceleration.
+---
 
+## 4. 数据准备 (两阶段)
+
+### 阶段一：通才教育数据 (AISHELL-3)
+
+1.  **下载**: 从 [OpenSLR](http://www.openslr.org/93/) 下载 `train.tar.gz` (36G) 和 `test.tar.gz` (4.7G)。
+2.  **解压**: 将两个压缩包**完整解压**到项目根目录。解压后，你的项目结构应如下：
+    ```
+    kokoro/
+    ├── train.py
+    ├── config.yaml
+    └── AISHELL-3/
+        ├── train/
+        │   ├── content.txt
+        │   └── wav/
+        └── test/
+            ├── content.txt
+            └── wav/
+    ```
+3.  **配置**: 打开 `config.yaml`，确保 `paths.aishell3_unzipped_train_dir` 和 `paths.aishell3_unzipped_test_dir` 正确指向了上面解压出的 `train` 和 `test` 文件夹。
+
+### 阶段二：专才培养数据 (你的目标声音)
+
+1.  **录制/准备**: 准备**至少 1 小时**的、由**同一个人**朗读的、**录音质量干净**的音频（如有声书）。
+2.  **切分与标注**: 将长音频切分成 3-15 秒的短句 `.wav` 文件，并为**每一个** `.wav` 创建一个同名的 `.txt` 文件，内容为对应的文本。
+3.  **组织**: 将所有 `.wav` 和 `.txt` 文件放入一个新的文件夹，例如 `my_audiobook_dataset`。
+
+---
+
+## 5. 训练执行 (两阶段)
+
+### **第一步：数据预处理**
+
+在开始任何训练之前，你需要先为 AISHELL-3 数据集运行一次预处理。这个步骤会将原始数据整理成“一 `wav` 配一 `txt`”的格式。
+
+在项目根目录下执行：
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 python run-your-kokoro-script.py
+python train.py --config config.yaml --prepare-data-only
 ```
+这个命令会根据你的 `config.yaml`，在 `processed_data` 路径下生成 `train` 和 `test` 两个文件夹，里面是整理好的数据。
 
-### Conda Environment
-Use the following conda `environment.yml` if you're facing any dependency issues.
-```yaml
-name: kokoro
-channels:
-  - defaults
-dependencies:
-  - python==3.9       
-  - libstdcxx~=12.4.0 # Needed to load espeak correctly. Try removing this if you're facing issues with Espeak fallback. 
-  - pip:
-      - kokoro>=0.3.1
-      - soundfile
-      - misaki[en]
-```
+### **第二步：第一阶段训练 (通才培养)**
 
-### Acknowledgements
-- 🛠️ [@yl4579](https://huggingface.co/yl4579) for architecting StyleTTS 2.
-- 🏆 [@Pendrokar](https://huggingface.co/Pendrokar) for adding Kokoro as a contender in the TTS Spaces Arena.
-- 📊 Thank you to everyone who contributed synthetic training data.
-- ❤️ Special thanks to all compute sponsors.
-- 👾 Discord server: https://discord.gg/QuGxSWBfQy
-- 🪽 Kokoro is a Japanese word that translates to "heart" or "spirit". Kokoro is also a [character in the Terminator franchise](https://terminator.fandom.com/wiki/Kokoro) along with [Misaki](https://github.com/hexgrad/misaki?tab=readme-ov-file#acknowledgements).
+1.  **目标**: 在 AISHELL-3 全量数据集上，训练 Mamba 模块，使其掌握通用的中文韵律。
+2.  **执行**:
+    ```bash
+    python train.py --config config.yaml
+    ```
+3.  **监控**: 观察终端输出的 `loss` 和 `val_loss`。当 `val_loss` 不再显著下降时，即可认为模型已初步收敛。
+4.  **产出**: 在 `output_dir` 目录中，会生成 `mamba_peft_epoch_xx.pth` 权重文件。
 
-<img src="https://static0.gamerantimages.com/wordpress/wp-content/uploads/2024/08/terminator-zero-41-1.jpg" width="400" alt="kokoro" />
+### **第三步：第二阶段训练 (专才培养)**
+
+1.  **目标**: 在第一阶段的基础上，用你自己的数据集，克隆目标音色和风格。
+2.  **配置**:
+    *   打开 `config.yaml`。
+    *   将 `paths.aishell3_unzipped_train_dir` 修改为**你自己的数据集路径** (`my_audiobook_dataset`)。
+    *   将 `paths.load_mamba_from` 修改为**第一阶段训练出的 `.pth` 文件路径**。
+    *   适当调低 `training.learning_rate` (例如 `5e-5`)。
+3.  **执行**:
+    *   **重要**: 先删除掉旧的 `processed_data` 文件夹，因为它还是 AISHELL-3 的数据。
+    *   首先，为你的新数据集运行预处理：`python train.py --config config.yaml --prepare-data-only`
+    *   然后，开始第二阶段训练：`python train.py --config config.yaml`
+
+---
+
+## 6. 推理与使用
+
+(此部分代码尚未实现，为未来展望)
+
+训练完成后，你将得到一个专属的 Mamba 权重。要使用它，你需要：
+1.  编写一个推理脚本。
+2.  加载原始的 `KModel`。
+3.  将你训练好的 Mamba 权重，加载回模型的 `predictor.text_encoder.lstms[0]`。
+4.  提供一段目标说话人的参考音频，用 `pipeline.audio_to_ref_s` 提取风格向量。
+5.  使用 `pipeline.text_to_phonemes` 和模型的 `forward_with_tokens` 方法，传入文本和风格向量，即可生成语音。
