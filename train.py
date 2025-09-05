@@ -219,6 +219,9 @@ def train(config: dict):
         print("="*50)
         return
 
+    # 【v3.2 修复】将 collator 的定义提前，以确保 val_dataloader 可以访问到它
+    collator = Collator(pipeline)
+
     # 【新增】加载验证集
     final_test_data_path = Path(config['paths']['processed_data_test_resampled'])
     if not final_test_data_path.exists() or not any(final_test_data_path.iterdir()):
@@ -231,20 +234,51 @@ def train(config: dict):
             print(f"警告: 验证数据集为空，路径: {final_test_data_path}。将继续进行无验证的训练。")
             val_dataloader = None
         else:
+            # 【v3.3 升级】使用独立的验证 batch_size
+            eval_batch_size = config.get('evaluation', {}).get('batch_size', config['training']['batch_size'])
             val_dataloader = DataLoader(
                 val_dataset,
-                batch_size=config['training']['batch_size'], # 可以为验证集设置不同的 batch_size
+                batch_size=eval_batch_size,
                 shuffle=False,
                 collate_fn=collator,
                 num_workers=config['training']['num_workers'],
                 pin_memory=True
             )
-            # 【新增】为验证音频样本准备固定数据
-            sample_generation_batch = next(iter(val_dataloader))
+            
+            # 【v3.3 升级】为专业样本生成做准备
             sample_output_dir = Path(config['paths']['output_dir']) / "samples"
             sample_output_dir.mkdir(exist_ok=True, parents=True)
             
-    collator = Collator(pipeline)
+            # 准备固定的参考音色
+            fixed_ref_s = None
+            ref_wav_path_str = config.get('evaluation', {}).get('reference_wav_path', "")
+            if ref_wav_path_str:
+                ref_wav_path = Path(ref_wav_path_str)
+                if ref_wav_path.exists():
+                    print(f"将使用固定参考音频进行样本生成: {ref_wav_path}")
+                    wav, sr = torchaudio.load(ref_wav_path)
+                    # 确保参考音频也是正确的采样率
+                    if sr != config['data']['target_sample_rate']:
+                        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=config['data']['target_sample_rate'])
+                        wav = resampler(wav)
+                    fixed_ref_s = pipeline.model.audio_to_ref_s(wav).to(device)
+                else:
+                    print(f"警告: 指定的参考音频路径不存在: {ref_wav_path}。将退回使用验证集中的随机参考音色。")
+            
+            # 如果没有指定固定音色，就从验证集里取一个
+            if fixed_ref_s is None:
+                print("将使用验证集中的第一个样本作为随机参考音色。")
+                sample_generation_batch = next(iter(val_dataloader))
+                fixed_ref_s = sample_generation_batch['ref_s'][:1].to(device)
+
+            # 准备固定的生成文本
+            sentences_to_generate = config.get('evaluation', {}).get('sentences_to_generate', [])
+            if not sentences_to_generate:
+                print("警告: 未在配置文件中指定用于生成的句子。将退回使用验证集中的随机文本。")
+                # 如果没指定句子，就用随机参考音色对应的那个句子
+                sentences_to_generate = [next(iter(val_dataset))['text']]
+
+
     dataloader = DataLoader(
         dataset, 
         batch_size=config['training']['batch_size'], 
@@ -307,18 +341,23 @@ def train(config: dict):
             avg_val_loss = val_loss / len(val_dataloader)
             print(f"Epoch {epoch+1} 验证完成，平均损失: {avg_val_loss:.4f}")
 
-            # 【新增】生成并保存音频样本
+            # 【v3.3 升级】使用专业级的样本生成逻辑
             print("正在生成音频样本...")
-            sample_input_ids = sample_generation_batch['input_ids'].to(device)
-            sample_ref_s = sample_generation_batch['ref_s'].to(device)
-            
             with torch.no_grad():
-                # 只生成第一个样本以节省时间
-                output_wav = model.forward_with_tokens(sample_input_ids[:1], sample_ref_s[:1])
+                for i, sentence in enumerate(sentences_to_generate):
+                    # 1. 文本转音素
+                    phonemes = pipeline.g2p(sentence)[0]
+                    input_ids = torch.LongTensor([0, *list(filter(None, map(pipeline.model.vocab.get, phonemes))), 0]).unsqueeze(0).to(device)
+                    
+                    # 2. 使用固定的参考音色进行合成
+                    output_wav = model.forward_with_tokens(input_ids, fixed_ref_s)
+                    
+                    # 3. 保存音频
+                    sample_path = sample_output_dir / f"epoch_{epoch+1}_sample_{i+1}.wav"
+                    torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
             
-            sample_path = sample_output_dir / f"epoch_{epoch+1}.wav"
-            torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
-            print(f"音频样本已保存至: {sample_path}")
+            print(f"音频样本已保存至: {sample_output_dir}")
+
 
         if (epoch + 1) % config['training']['save_every_n_epochs'] == 0:
             output_path = Path(config['paths']['output_dir'])

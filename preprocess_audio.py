@@ -4,8 +4,9 @@ from pathlib import Path
 import torchaudio
 from tqdm import tqdm
 import shutil
+import torch
 
-def run_preprocessing_for_split(config: dict, split: str):
+def run_preprocessing_for_split(config: dict, split: str, device: torch.device):
     """
     对指定的数据划分（'train' 或 'test'）进行音频预处理。
     """
@@ -45,15 +46,17 @@ def run_preprocessing_for_split(config: dict, split: str):
     
     for wav_path in tqdm(wav_files, desc=f"处理 {split} .wav 文件"):
         wav, sr = torchaudio.load(wav_path)
+        wav = wav.to(device) # 【加速】将音频张量移动到 GPU
         
         if sr != target_sr:
             if sr not in resampler_cache:
-                resampler_cache[sr] = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
+                # 【加速】将重采样器也创建在 GPU 上
+                resampler_cache[sr] = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr).to(device)
             wav = resampler_cache[sr](wav)
         
         torchaudio.save(
             target_data_path / wav_path.name,
-            wav,
+            wav.cpu(), # 保存前回退到 CPU
             target_sr
         )
     print(f"'{split}' 数据集处理完成。")
@@ -64,13 +67,15 @@ def preprocess_audio_files(config: dict):
     一次性将所有音频文件重采样到目标采样率，并复制相应的文本文件。
     这是一个独立的预处理步骤，旨在避免在训练循环中进行低效的实时重采样。
     """
+    # 【新增】检测并设置设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("="*50)
-    print(f"开始音频预处理...")
+    print(f"开始音频预处理... 使用设备: {device}")
     print(f"目标采样率: {config['data']['target_sample_rate']} Hz")
     
     # 同时处理训练集和测试集
-    run_preprocessing_for_split(config, 'train')
-    run_preprocessing_for_split(config, 'test')
+    run_preprocessing_for_split(config, 'train', device)
+    run_preprocessing_for_split(config, 'test', device)
     
     print("="*50)
     print("所有音频预处理完成！")
