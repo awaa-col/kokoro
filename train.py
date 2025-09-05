@@ -36,6 +36,10 @@ def prepare_aishell3_dataset_from_unzipped(config: dict):
         print(f"错误: 找不到 AISHELL-3 的训练目录: {unzipped_dir}")
         print("请确保你已经将 train.tar.gz 完整解压，并正确配置了 config.yaml 中的路径。")
         return False
+    
+    if not content_path.exists():
+        print(f"错误: 在 {unzipped_dir} 中找不到标注文件 content.txt")
+        return False
         
     transcript_dict = {}
     with open(content_path, 'r', encoding='utf-8') as f:
@@ -90,12 +94,12 @@ class Collator:
         batch = [item for item in batch if item is not None]
         if not batch: return None
         texts, wavs = [i['text'] for i in batch], [i['wav'] for i in batch]
-        phonemes_list = [self.pipeline.text_to_phonemes(t) for t in texts]
+        phonemes_list = [self.pipeline.g2p(t)[0] for t in texts]
         input_ids_list = [torch.LongTensor([0, *list(filter(None, map(self.pipeline.model.vocab.get, p))), 0]) for p in phonemes_list]
         input_ids_padded = pad_sequence(input_ids_list, batch_first=True, padding_value=0)
-        mel_targets = [self.pipeline.stft.mel_spectrogram(w.unsqueeze(0)) for w in wavs]
+        mel_targets = [self.pipeline.model.stft.mel_spectrogram(w.unsqueeze(0)) for w in wavs]
         mel_padded = pad_sequence([m.squeeze(0).T for m in mel_targets], batch_first=True).transpose(1,2)
-        ref_s_list = [self.pipeline.audio_to_ref_s(w) for w in wavs]
+        ref_s_list = [self.pipeline.model.audio_to_ref_s(w) for w in wavs]
         ref_s = torch.stack(ref_s_list)
         return {"input_ids": input_ids_padded, "ref_s": ref_s, "mel_targets": mel_padded}
 
@@ -157,7 +161,7 @@ def train(config: dict):
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")
     
     model = KModel(repo_id=config['paths']['repo_id'])
-    pipeline = KPipeline(model=model)
+    pipeline = KPipeline(lang_code='z', model=model, repo_id=config['paths']['repo_id'])
     
     model.predictor.text_encoder = replace_lstm_with_mamba_in_durationencoder(model.predictor.text_encoder, config['mamba'])
     if config['paths']['load_mamba_from']:
