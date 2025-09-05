@@ -14,7 +14,7 @@ import random
 # --- 导入 Kokoro 核心组件 ---
 from kokoro.model import KModel
 from kokoro.pipeline import KPipeline
-from kokoro.modules import DurationEncoder
+from kokoro.modules import DurationEncoder, TextEncoder
 
 # ================================================================
 # 核心逻辑区
@@ -118,24 +118,28 @@ class Collator:
         phonemes_list = [self.pipeline.g2p(t)[0] for t in texts]
         input_ids_list = [torch.LongTensor([0, *list(filter(None, map(self.pipeline.model.vocab.get, p))), 0]) for p in phonemes_list]
         input_ids_padded = pad_sequence(input_ids_list, batch_first=True, padding_value=0)
-        mel_targets = [self.pipeline.model.stft.mel_spectrogram(w.unsqueeze(0)) for w in wavs]
+        
+        # 【v4.1 修复】调用 pipeline 提供的稳定接口，而不是直接访问可能在子进程中出问题的 model 内部
+        mel_targets = [self.pipeline.stft.mel_spectrogram(w.unsqueeze(0)) for w in wavs]
         mel_padded = pad_sequence([m.squeeze(0).T for m in mel_targets], batch_first=True).transpose(1,2)
-        ref_s_list = [self.pipeline.model.audio_to_ref_s(w) for w in wavs]
+        ref_s_list = [self.pipeline.audio_to_ref_s(w) for w in wavs]
+        
         ref_s = torch.stack(ref_s_list)
         return {"input_ids": input_ids_padded, "ref_s": ref_s, "mel_targets": mel_padded}
 
-def replace_lstm_with_mamba_in_durationencoder(duration_encoder: DurationEncoder, mamba_config: dict):
-    sty_dim, d_model = duration_encoder.sty_dim, duration_encoder.d_model
-    mamba_module = Mamba(d_model=d_model + sty_dim, d_state=mamba_config['d_state'], d_conv=mamba_config['d_conv'], expand=mamba_config['expand'])
-    duration_encoder.lstms = torch.nn.ModuleList([mamba_module])
-    def mamba_forward(self, x, style, text_lengths, m):
-        s = style.expand(x.shape[0], x.shape[1], -1)
-        mamba_input = torch.cat([x.permute(2, 0, 1), s], axis=-1).transpose(0, 1)
-        mamba_input.masked_fill_(m.unsqueeze(-1), 0.0)
-        return self.lstms[0](mamba_input).transpose(-1, -2)
-    DurationEncoder.forward = mamba_forward
-    print("模型手术成功！DurationEncoder 已被 Mamba 强化。")
-    return duration_encoder
+# 【v4.2 移除】这个函数和它所代表的 “猴子补丁” 思想已被废除
+# def replace_lstm_with_mamba_in_durationencoder(duration_encoder: DurationEncoder, mamba_config: dict):
+#     sty_dim, d_model = duration_encoder.sty_dim, duration_encoder.d_model
+#     mamba_module = Mamba(d_model=d_model + sty_dim, d_state=mamba_config['d_state'], d_conv=mamba_config['d_conv'], expand=mamba_config['expand'])
+#     duration_encoder.lstms = torch.nn.ModuleList([mamba_module])
+#     def mamba_forward(self, x, style, text_lengths, m):
+#         s = style.expand(x.shape[0], x.shape[1], -1)
+#         mamba_input = torch.cat([x.permute(2, 0, 1), s], axis=-1).transpose(0, 1)
+#         mamba_input.masked_fill_(m.unsqueeze(-1), 0.0)
+#         return self.lstms[0](mamba_input).transpose(-1, -2)
+#     DurationEncoder.forward = mamba_forward
+#     print("模型手术成功！DurationEncoder 已被 Mamba 强化。")
+#     return duration_encoder
 
 def adapt_model_for_finetuning(model: KModel):
     original_forward = model.forward_with_tokens
@@ -169,7 +173,7 @@ def adapt_model_for_finetuning(model: KModel):
 
 def setup_peft(model: KModel):
     for param in model.parameters(): param.requires_grad = False
-    for param in model.predictor.text_encoder.lstms[0].parameters(): param.requires_grad = True
+    for param in model.predictor.text_encoder.duration_encoder.mamba.parameters(): param.requires_grad = True
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"PEFT 设置完成. 可训练参数: {trainable_params} ({trainable_params/sum(p.numel() for p in model.parameters())*100:.4f}%)")
     return model
@@ -179,12 +183,32 @@ def train(config: dict):
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")
     
     model = KModel(repo_id=config['paths']['repo_id'])
+
+    # 【v4.2 升级】直接在模型初始化后，用我们新的、经过基因改造的 DurationEncoder 替换掉旧的
+    # 这种做法比“猴子补丁”更干净、更稳定、更易于理解
+    old_encoder = model.predictor.text_encoder
+    new_duration_encoder = DurationEncoder(
+        in_channels=old_encoder.in_channels,
+        filter_channels=old_encoder.filter_channels,
+        kernel_size=old_encoder.kernel_size,
+        p_dropout=old_encoder.p_dropout,
+        gin_channels=old_encoder.gin_channels,
+        use_mamba=True,
+        mamba_config=config['mamba']
+    )
+    # 把 TextEncoder 内部的 duration_encoder 替换掉
+    model.predictor.text_encoder.duration_encoder = new_duration_encoder
+
     pipeline = KPipeline(lang_code='z', model=model, repo_id=config['paths']['repo_id'])
     
-    model.predictor.text_encoder = replace_lstm_with_mamba_in_durationencoder(model.predictor.text_encoder, config['mamba'])
+    # 【v4.2 移除】猴子补丁函数已被删除
+    # model.predictor.text_encoder = replace_lstm_with_mamba_in_durationencoder(model.predictor.text_encoder, config['mamba'])
+    
     if config['paths']['load_mamba_from']:
         try:
-            model.predictor.text_encoder.lstms[0].load_state_dict(torch.load(config['paths']['load_mamba_from'], map_location=device))
+            # 【v4.2 升级】现在我们加载权重的目标更明确了
+            mamba_weights = torch.load(config['paths']['load_mamba_from'], map_location=device)
+            model.predictor.text_encoder.duration_encoder.mamba.load_state_dict(mamba_weights)
             print(f"Mamba 权重从 {config['paths']['load_mamba_from']} 加载成功！")
         except Exception as e:
             print(f"加载 Mamba 权重失败: {e}")
@@ -192,6 +216,30 @@ def train(config: dict):
     model = setup_peft(model)
     model.to(device)
     
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['training']['learning_rate'])
+    loss_fn = torch.nn.L1Loss()
+    scaler = torch.cuda.amp.GradScaler(enabled=(config['training']['use_amp'] and device.type == 'cuda'))
+
+    # 【v4.2 新增】检查点加载逻辑
+    start_epoch = 0
+    checkpoint_dir = Path(config['paths']['checkpoint_dir'])
+    checkpoint_dir.mkdir(exist_ok=True, parents=True)
+    latest_checkpoint_path = checkpoint_dir / "latest.pth"
+
+    if latest_checkpoint_path.exists():
+        print(f"发现检查点, 正在从 {latest_checkpoint_path} 加载...")
+        try:
+            checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"成功加载检查点。将从 Epoch {start_epoch} 继续训练。")
+        except Exception as e:
+            print(f"加载检查点失败: {e}。将从头开始训练。")
+            start_epoch = 0
+    else:
+        print("未发现检查点，将从头开始训练。")
+
     # 【核心修改】现在我们从重采样后的目录加载数据
     final_data_path = Path(config['paths']['processed_data_resampled'])
     if not final_data_path.exists() or not any(final_data_path.iterdir()):
@@ -308,12 +356,8 @@ def train(config: dict):
         pin_memory=True
     )
     
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['training']['learning_rate'])
-    loss_fn = torch.nn.L1Loss()
-    scaler = torch.cuda.amp.GradScaler(enabled=(config['training']['use_amp'] and device.type == 'cuda'))
-    
     print("="*50, "\n训练开始！\n", "="*50)
-    for epoch in range(config['training']['epochs']):
+    for epoch in range(start_epoch, config['training']['epochs']):
         model.train()
         train_loss = 0.0
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']} [训练]")
@@ -366,14 +410,26 @@ def train(config: dict):
                 generate_samples(epoch)
                 print(f"音频样本已保存至: {sample_output_dir}")
 
+        # 【v4.2 升级】保存完整的检查点
         if (epoch + 1) % config['training']['save_every_n_epochs'] == 0:
-            output_path = Path(config['paths']['output_dir'])
-            output_path.mkdir(exist_ok=True)
-            mamba_weights = model.predictor.text_encoder.lstms[0].state_dict()
-            save_path = output_path / f"mamba_peft_epoch_{epoch+1}.pth"
-            torch.save(mamba_weights, save_path)
-            print(f"Mamba 模块权重已保存: {save_path}")
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pth"
+            print(f"正在保存检查点至 {checkpoint_path}...")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss if val_dataloader else None,
+            }, checkpoint_path)
             
+            # 更新 latest.pth 指针
+            if latest_checkpoint_path.exists():
+                latest_checkpoint_path.unlink()
+            # 在 Windows 上使用 copy 来模拟软链接
+            shutil.copy(checkpoint_path, latest_checkpoint_path)
+
+            print("检查点保存完毕。")
+
     print("微调完成！")
 
 if __name__ == "__main__":

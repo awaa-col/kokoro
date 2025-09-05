@@ -143,6 +143,16 @@ class KPipeline:
             logger.warning(f"Using EspeakG2P(language='{language}'). Chunking logic not yet implemented, so long texts may be truncated unless you split them with '\\n'.")
             self.g2p = espeak.EspeakG2P(language=language)
 
+        # 【v4.1 修复】添加委托，将 model 的核心功能暴露在 pipeline层面，增强封装性
+        if self.model:
+            self.stft = self.model.stft
+
+    def audio_to_ref_s(self, wav: torch.FloatTensor) -> torch.FloatTensor:
+        """委托给 KModel 的 audio_to_ref_s 方法"""
+        if not self.model:
+            raise ValueError("Pipeline is in 'quiet' mode (model=False) and cannot process audio.")
+        return self.model.audio_to_ref_s(wav)
+
     def load_single_voice(self, voice: str):
         if voice in self.voices:
             return self.voices[voice]

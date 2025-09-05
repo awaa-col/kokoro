@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import Conv1d, Embedding, Linear, ModuleList
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from mamba_ssm import Mamba
 
 
 class LinearNorm(nn.Module):
@@ -135,45 +138,69 @@ class ProsodyPredictor(nn.Module):
 
 
 class DurationEncoder(nn.Module):
-    def __init__(self, sty_dim, d_model, nlayers, dropout=0.1):
+    def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0, use_mamba=False, mamba_config=None):
         super().__init__()
-        self.lstms = nn.ModuleList()
-        for _ in range(nlayers):
-            self.lstms.append(nn.LSTM(d_model + sty_dim, d_model // 2, num_layers=1, batch_first=True, bidirectional=True))
-            self.lstms.append(AdaLayerNorm(sty_dim, d_model))
-        self.dropout = dropout
-        self.d_model = d_model
-        self.sty_dim = sty_dim
+        self.in_channels = in_channels
+        self.filter_channels = filter_channels
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.gin_channels = gin_channels
 
-    def forward(self, x, style, text_lengths, m):
-        masks = m
-        x = x.permute(2, 0, 1)
-        s = style.expand(x.shape[0], x.shape[1], -1)
-        x = torch.cat([x, s], axis=-1)
-        x.masked_fill_(masks.unsqueeze(-1).transpose(0, 1), 0.0)
-        x = x.transpose(0, 1)
-        x = x.transpose(-1, -2)
-        for block in self.lstms:
-            if isinstance(block, AdaLayerNorm):
-                x = block(x.transpose(-1, -2), style).transpose(-1, -2)
-                x = torch.cat([x, s.permute(1, 2, 0)], axis=1)
-                x.masked_fill_(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
-            else:
-                lengths = text_lengths if text_lengths.device == torch.device('cpu') else text_lengths.to('cpu')
-                x = x.transpose(-1, -2)
-                x = nn.utils.rnn.pack_padded_sequence(
-                    x, lengths, batch_first=True, enforce_sorted=False)
-                block.flatten_parameters()
-                x, _ = block(x)
-                x, _ = nn.utils.rnn.pad_packed_sequence(
-                    x, batch_first=True)
-                x = F.dropout(x, p=self.dropout, training=False)
-                x = x.transpose(-1, -2)
-                x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
-                x_pad[:, :, :x.shape[-1]] = x
-                x = x_pad
+        self.drop = nn.Dropout(p_dropout)
+        self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size//2)
+        self.norm_1 = attentions.LayerNorm(filter_channels)
+        self.conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size//2)
+        self.norm_2 = attentions.LayerNorm(filter_channels)
+        self.proj = nn.Conv1d(filter_channels, 1, 1)
 
-        return x.transpose(-1, -2)
+        self.use_mamba = use_mamba
+        if use_mamba:
+            if mamba_config is None:
+                raise ValueError("Mamba config must be provided when use_mamba is True.")
+            # Mamba 模块的输入维度是 d_model，这里等于 in_channels
+            # 我们需要将风格向量 gin (sty_dim) 和文本向量 (d_model) 拼接起来
+            self.mamba = Mamba(
+                d_model=in_channels + gin_channels,
+                d_state=mamba_config['d_state'],
+                d_conv=mamba_config['d_conv'],
+                expand=mamba_config['expand']
+            )
+        else:
+            self.lstm = nn.LSTM(in_channels, filter_channels//2, 1, batch_first=True, bidirectional=True)
+
+    def forward(self, x, x_mask, g=None):
+        x = torch.detach(x)
+        if g is not None:
+            g = torch.detach(g)
+            x = x + g
+        x = self.conv_1(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_1(x)
+        x = self.drop(x)
+        x = self.conv_2(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_2(x)
+        x = self.drop(x)
+        
+        if self.use_mamba:
+            # Mamba 需要 (B, L, D) 的输入格式
+            mamba_input = x.transpose(1, 2)
+            if g is not None:
+                # 将 style 向量在长度维度上扩展并拼接
+                style_expanded = g.transpose(1, 2).expand(-1, mamba_input.size(1), -1)
+                mamba_input = torch.cat([mamba_input, style_expanded], dim=-1)
+            
+            mamba_input.masked_fill_(x_mask.transpose(1, 2) == 0, 0.0)
+            x = self.mamba(mamba_input) # Mamba 输出也是 (B, L, D)
+            x = x.transpose(1, 2) # 转回 (B, D, L)
+        else:
+            x = x.transpose(1, 2)
+            # go through an LSTM
+            x, _ = self.lstm(x)
+            x = x.transpose(1, 2)
+
+        x = self.proj(x * x_mask)
+        return x * x_mask
 
 
 # https://github.com/yl4579/StyleTTS2/blob/main/Utils/PLBERT/util.py
