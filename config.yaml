@@ -8,8 +8,19 @@ paths:
   repo_id: "hexgrad/Kokoro-82M-v1.1-zh"
   # 【重要】这里现在指向你完整解压后的 AISHELL-3 train 文件夹
   aishell3_unzipped_train_dir: "./AISHELL-3/train"
+  # 【新增】指向 AISHELL-3 test 文件夹
+  aishell3_unzipped_test_dir: "./AISHELL-3/test"
+
   # 预处理后的数据存放位置
-  processed_data: "./AISHELL-3-processed"
+  processed_data: "./AISHELL-3-processed/train"
+  # 【新增】测试集的预处理数据存放位置
+  processed_data_test: "./AISHELL-3-processed/test"
+
+  # 【新增】经过重采样后的、最终用于训练的数据存放位置
+  processed_data_resampled: "./AISHELL-3-processed-24k/train"
+  # 【新增】经过重采样后的、最终用于验证的数据存放位置
+  processed_data_test_resampled: "./AISHELL-3-processed-24k/test"
+
   # 模型权重输出目录
   output_dir: "./kokoro_finetuned_model_4070L"
   # (可选) 第二阶段微调时，加载第一阶段的 Mamba 权重

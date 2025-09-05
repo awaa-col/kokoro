@@ -21,6 +21,8 @@ dependencies = [
     "huggingface_hub",
     "loguru",
     "misaki[en]>=0.9.4",
+    "misaki[zh]>=0.9.4",
+    "ordered-set",
     "numpy",
     "torch",
     "transformers"

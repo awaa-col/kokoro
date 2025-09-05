@@ -9,6 +9,7 @@ from typing import List
 from pathlib import Path
 from tqdm import tqdm
 import shutil
+import random
 
 # --- 导入 Kokoro 核心组件 ---
 from kokoro.model import KModel
@@ -19,22 +20,27 @@ from kokoro.modules import DurationEncoder
 # 核心逻辑区
 # ================================================================
 
-def prepare_aishell3_dataset_from_unzipped(config: dict):
+def prepare_aishell3_dataset(config: dict, split: str):
     """
-    【最终版 v2.0】从一个完整解压的 AISHELL-3 目录创建训练集。
+    【v3.0】从一个完整解压的 AISHELL-3 目录创建训练集或测试集。
     """
-    # 【升级】现在从一个根目录读取路径
-    unzipped_dir = Path(config['paths']['aishell3_unzipped_train_dir'])
+    if split == 'train':
+        unzipped_dir = Path(config['paths']['aishell3_unzipped_train_dir'])
+        output_path = Path(config['paths']['processed_data'])
+    elif split == 'test':
+        unzipped_dir = Path(config['paths']['aishell3_unzipped_test_dir'])
+        output_path = Path(config['paths']['processed_data_test'])
+    else:
+        raise ValueError(f"未知的数据划分: {split}")
+
     content_path = unzipped_dir / "content.txt"
     wav_root_path = unzipped_dir / "wav"
-    output_path = Path(config['paths']['processed_data'])
     
-    print("="*50, "\n开始从已解压目录进行数据预处理...")
-    output_path.mkdir(exist_ok=True)
+    print("="*50, f"\n开始从已解压目录进行 {split} 数据预处理...")
+    output_path.mkdir(exist_ok=True, parents=True)
     
     if not unzipped_dir.exists():
-        print(f"错误: 找不到 AISHELL-3 的训练目录: {unzipped_dir}")
-        print("请确保你已经将 train.tar.gz 完整解压，并正确配置了 config.yaml 中的路径。")
+        print(f"错误: 找不到 AISHELL-3 的 {split} 目录: {unzipped_dir}")
         return False
     
     if not content_path.exists():
@@ -45,14 +51,21 @@ def prepare_aishell3_dataset_from_unzipped(config: dict):
     with open(content_path, 'r', encoding='utf-8') as f:
         for line in f:
             try:
-                wav_name, text, _ = line.strip().split('|', 2)
+                # AISHELL-3 test set content.txt has a different format
+                if split == 'test':
+                    parts = line.strip().split()
+                    wav_name = parts[0]
+                    text = " ".join(parts[1:])
+                else:
+                    wav_name, text, _ = line.strip().split('|', 2)
+                
                 transcript_dict[wav_name.strip()] = text.strip()
             except ValueError: continue
     
     print(f"标注文件加载完毕，共 {len(transcript_dict)} 条记录。")
 
     all_wav_files = list(wav_root_path.glob("*/*.wav"))
-    for src_wav_path in tqdm(all_wav_files, desc="正在整理文件"):
+    for src_wav_path in tqdm(all_wav_files, desc=f"正在整理 {split} 文件"):
         wav_filename = src_wav_path.name
         text = transcript_dict.get(wav_filename)
         
@@ -65,15 +78,19 @@ def prepare_aishell3_dataset_from_unzipped(config: dict):
             dest_wav_path = output_path / wav_filename
             shutil.copy(src_wav_path, dest_wav_path)
 
-    print("="*50, "\n数据预处理完成！\n", "="*50)
+    print("="*50, f"\n{split} 数据预处理完成！\n", "="*50)
     return True
 
+
 class CustomAudioDataset(Dataset):
-    def __init__(self, data_path: str, target_sr: int):
+    def __init__(self, data_path: str, target_sr: int, max_samples: int = None):
         self.data_path = Path(data_path)
         self.wav_files = list(self.data_path.glob("*.wav"))
+        if max_samples is not None:
+            self.wav_files = self.wav_files[:max_samples]
         self.target_sr = target_sr
-        self.resampler_cache = {}
+        # 移除了 resampler_cache，因为我们现在使用预处理好的数据
+        # self.resampler_cache = {}
 
     def __len__(self): return len(self.wav_files)
     def __getitem__(self, idx):
@@ -81,11 +98,14 @@ class CustomAudioDataset(Dataset):
         text_path = wav_path.with_suffix(".txt")
         if not text_path.exists(): return None
         with open(text_path, 'r', encoding='utf-8') as f: text = f.read().strip()
+        
+        # 直接加载已经重采样好的音频
         wav, sr = torchaudio.load(wav_path)
-        if sr != self.target_sr:
-            if sr not in self.resampler_cache:
-                self.resampler_cache[sr] = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sr)
-            wav = self.resampler_cache[sr](wav)
+        
+        # 【重要】做一个断言检查，确保我们加载的数据确实是正确的采样率
+        # 这样可以避免因为数据目录错误导致的潜在问题
+        assert sr == self.target_sr, f"音频采样率与目标不符！文件: {wav_path}, 实际: {sr}, 目标: {self.target_sr}"
+        
         return {"text": text, "wav": wav.squeeze(0)}
 
 class Collator:
@@ -154,8 +174,16 @@ def setup_peft(model: KModel):
     return model
     
 def train(config: dict):
-    if not (Path(config['paths']['processed_data']).exists() and any(Path(config['paths']['processed_data']).iterdir())):
-        if not prepare_aishell3_dataset_from_unzipped(config): return
+    # 【v3.0】同时检查训练集和测试集的预处理目录
+    processed_train_path = Path(config['paths']['processed_data'])
+    processed_test_path = Path(config['paths']['processed_data_test'])
+    if not (processed_train_path.exists() and any(processed_train_path.iterdir())):
+        print("未找到预处理过的训练数据，开始生成...")
+        if not prepare_aishell3_dataset(config, 'train'): return
+    
+    if not (processed_test_path.exists() and any(processed_test_path.iterdir())):
+        print("未找到预处理过的测试数据，开始生成...")
+        if not prepare_aishell3_dataset(config, 'test'): return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")
@@ -174,7 +202,44 @@ def train(config: dict):
     model = setup_peft(model)
     model.to(device)
     
-    dataset = CustomAudioDataset(config['paths']['processed_data'], target_sr=config['data']['target_sample_rate'])
+    # 【核心修改】现在我们从重采样后的目录加载数据
+    final_data_path = config['paths']['processed_data_resampled']
+    print(f"将从最终预处理目录加载训练数据: {final_data_path}")
+    dataset = CustomAudioDataset(final_data_path, target_sr=config['data']['target_sample_rate'])
+    
+    if len(dataset) == 0:
+        print("="*50)
+        print("错误：训练数据集为空！")
+        print(f"请确保 '{final_data_path}' 目录中包含有效的 .wav 和 .txt 文件。")
+        print("这通常是因为数据预处理步骤未能成功生成任何有效的训练样本。")
+        print("请检查以下几点：")
+        print(f"  1. 你的 `config.yaml` 中的 `aishell3_unzipped_train_dir` 路径 ('{config['paths']['aishell3_unzipped_train_dir']}') 是否正确。")
+        print(f"  2. 运行 `preprocess_audio.py` 脚本是否成功，并且没有报错。")
+        print("程序将终止。")
+        print("="*50)
+        return
+
+    # 【新增】加载验证集
+    final_test_data_path = config['paths']['processed_data_test_resampled']
+    print(f"将从最终预处理目录加载验证数据: {final_test_data_path}")
+    val_dataset = CustomAudioDataset(final_test_data_path, target_sr=config['data']['target_sample_rate'])
+    if len(val_dataset) == 0:
+        print(f"警告: 验证数据集为空，路径: {final_test_data_path}。将继续进行无验证的训练。")
+        val_dataloader = None
+    else:
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=config['training']['batch_size'], # 可以为验证集设置不同的 batch_size
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=config['training']['num_workers'],
+            pin_memory=True
+        )
+        # 【新增】为验证音频样本准备固定数据
+        sample_generation_batch = next(iter(val_dataloader))
+        sample_output_dir = Path(config['paths']['output_dir']) / "samples"
+        sample_output_dir.mkdir(exist_ok=True, parents=True)
+        
     collator = Collator(pipeline)
     dataloader = DataLoader(
         dataset, 
@@ -192,7 +257,8 @@ def train(config: dict):
     print("="*50, "\n训练开始！\n", "="*50)
     for epoch in range(config['training']['epochs']):
         model.train()
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}")
+        train_loss = 0.0
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']} [训练]")
         
         for batch in progress_bar:
             if batch is None: continue
@@ -209,8 +275,47 @@ def train(config: dict):
             scaler.step(optimizer)
             scaler.update()
             
-            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+            loss_item = loss.item()
+            train_loss += loss_item
+            progress_bar.set_postfix({"loss": f"{loss_item:.4f}"})
             
+        avg_train_loss = train_loss / len(dataloader)
+        print(f"Epoch {epoch+1} 训练完成，平均损失: {avg_train_loss:.4f}")
+
+        # 【新增】验证环节
+        if val_dataloader:
+            model.eval()
+            val_loss = 0.0
+            val_progress_bar = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']} [验证]")
+            with torch.no_grad():
+                for batch in val_progress_bar:
+                    if batch is None: continue
+                    input_ids, ref_s, mel_targets = batch['input_ids'].to(device), batch['ref_s'].to(device), batch['mel_targets'].to(device)
+                    
+                    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(config['training']['use_amp'] and device.type == 'cuda')):
+                        predicted_mel, _, _ = model.forward_with_tokens(input_ids, ref_s, return_mel=True)
+                        min_len = min(predicted_mel.shape[-1], mel_targets.shape[-1])
+                        loss = loss_fn(predicted_mel[..., :min_len], mel_targets[..., :min_len])
+                    
+                    val_loss += loss.item()
+                    val_progress_bar.set_postfix({"val_loss": f"{loss.item():.4f}"})
+            
+            avg_val_loss = val_loss / len(val_dataloader)
+            print(f"Epoch {epoch+1} 验证完成，平均损失: {avg_val_loss:.4f}")
+
+            # 【新增】生成并保存音频样本
+            print("正在生成音频样本...")
+            sample_input_ids = sample_generation_batch['input_ids'].to(device)
+            sample_ref_s = sample_generation_batch['ref_s'].to(device)
+            
+            with torch.no_grad():
+                # 只生成第一个样本以节省时间
+                output_wav = model.forward_with_tokens(sample_input_ids[:1], sample_ref_s[:1])
+            
+            sample_path = sample_output_dir / f"epoch_{epoch+1}.wav"
+            torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
+            print(f"音频样本已保存至: {sample_path}")
+
         if (epoch + 1) % config['training']['save_every_n_epochs'] == 0:
             output_path = Path(config['paths']['output_dir'])
             output_path.mkdir(exist_ok=True)

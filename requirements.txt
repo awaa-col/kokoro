@@ -1,0 +1,15 @@
+huggingface_hub
+loguru
+"misaki[en,zh]>=0.9.4"
+ordered-set
+numpy
+torch
+torchaudio
+transformers
+PyYAML
+mamba-ssm
+tqdm
+safetensors
+einops
+rotary-embedding-torch
+librosa
