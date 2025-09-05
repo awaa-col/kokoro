@@ -32,19 +32,19 @@ class TrainingConfig:
     """
     repo_id: str = "hexgrad/Kokoro-82M-v1.1-zh"
     
-    # 原始 AISHELL-3 数据路径
-    aishell3_tar_path: str = "./train.tar.gz" 
-    aishell3_content_path: str = "./AISHELL-3/train/content.txt"
+    # 新增：原始 AISHELL-3 数据路径
+    aishell3_tar_path: str = "./train.tar.gz" # <-- *** 新增 ***
+    aishell3_content_path: str = "./AISHELL-3/train/content.txt" # <-- *** 新增 ***
     
     # data_path 现在指向处理后的数据
-    data_path: str = "./AISHELL-3-processed"
+    data_path: str = "./AISHELL-3-processed"  # <-- *** 路径已更新 ***
 
-    # 解除封印！我们现在有资源了，就要用全部的数据！
-    sampling_ratio: float = 1.0 # <-- *** 已更新 ***: Pro 用户就该用 100% 的数据！
+    # 新增：数据抽样比例，用于解决垃圾环境的存储问题
+    sampling_ratio: float = 0.25 # <-- *** 新增 ***: 设为 0.25 只处理 25% 的数据
     
     # 训练参数
-    epochs: int = 10 # <-- *** 已更新 ***: 根据 A100 的实际算力，调整到一个更合理的轮数
-    batch_size: int = 16 # <-- *** 已更新 ***: A100/T4 就该用更大的 batch size!
+    epochs: int = 50
+    batch_size: int = 4 # 根据你的显存调整，别傻傻地 OOM 了
     learning_rate: float = 1e-4
     
     # Mamba 配置 (这里的参数你可以随便玩，玩炸了别怪我)
@@ -394,7 +394,7 @@ def train(config: TrainingConfig):
         batch_size=config.batch_size, 
         shuffle=True, 
         collate_fn=collator,
-        num_workers=8 # <-- *** 已更新 ***: Pro 用户值得拥有更快的 IO
+        num_workers=4 # 如果你的系统支持，可以开多线程加速
     )
     
     # --- 4. 设置优化器和损失函数 ---
