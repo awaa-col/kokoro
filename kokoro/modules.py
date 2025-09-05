@@ -14,11 +14,11 @@ import torch
 from torch import nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-from kokoro import commons
-from kokoro import attentions
+from . import commons
+from . import attentions
 
 
-# 【v4.4 终极修复】恢复被意外删除的 DurationEncoder 类
+# 【v4.5 终极修复】恢复被意外删除的 DurationEncoder 类
 class DurationEncoder(nn.Module):
     def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0):
         super().__init__()
@@ -213,7 +213,7 @@ class ProsodyPredictor(nn.Module):
         self.duration_proj = nn.Linear(d_hid, 1)
 
     def forward(self, x, s, text_lengths, m):
-        m, logs, duration, x_mask = self.text_encoder(x, text_lengths, g=s)
+        m, logs, logw, x_mask = self.text_encoder(x, text_lengths, g=s)
         # some legacy code
         x = m.transpose(1, 2)
         x, _ = self.lstm(x)

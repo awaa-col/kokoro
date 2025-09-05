@@ -143,39 +143,9 @@ class Collator:
 #     print("模型手术成功！DurationEncoder 已被 Mamba 强化。")
 #     return duration_encoder
 
-def adapt_model_for_finetuning(model: KModel):
-    original_forward = model.forward_with_tokens
-    def training_forward(self, input_ids, ref_s, speed=1, return_mel=False):
-        if not return_mel: return original_forward(input_ids, ref_s, speed)
-        input_lengths = torch.full((input_ids.shape[0],), input_ids.shape[-1], device=input_ids.device, dtype=torch.long)
-        text_mask = torch.gt(torch.arange(input_lengths.max(), device=self.device).unsqueeze(0) + 1, input_lengths.unsqueeze(1))
-        bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
-        d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
-        s = ref_s[:, 128:]
-        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-        x, _ = self.predictor.lstm(d)
-        duration = self.predictor.duration_proj(x)
-        duration = torch.sigmoid(duration).sum(axis=-1) / speed
-        pred_dur = torch.round(duration).clamp(min=1).long()
-        max_len = pred_dur.sum(axis=-1).max()
-        pred_aln_trg_list = []
-        for i in range(input_ids.shape[0]):
-            indices = torch.repeat_interleave(torch.arange(input_ids.shape[1], device=self.device), pred_dur[i])
-            pred_aln_trg = torch.zeros((input_ids.shape[1], max_len), device=self.device)
-            valid_indices = indices[indices < input_ids.shape[1]]
-            pred_aln_trg[valid_indices, torch.arange(len(valid_indices), device=self.device)] = 1
-            pred_aln_trg_list.append(pred_aln_trg)
-        pred_aln_trg = torch.stack(pred_aln_trg_list)
-        en = d.transpose(-1, -2) @ pred_aln_trg
-        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
-        t_en = self.text_encoder(input_ids, input_lengths, text_mask)
-        return t_en @ pred_aln_trg, F0_pred, N_pred
-    KModel.forward_with_tokens = training_forward
-    return model
-
 def setup_peft(model: KModel):
     for param in model.parameters(): param.requires_grad = False
-    # 【v4.3 升级】PEFT 的目标现在是 TextEncoder 内部的 Mamba 模块
+    # 【v4.5】PEFT 的目标现在是 TextEncoder 内部的 Mamba 模块
     for param in model.predictor.text_encoder.duration_predictor.parameters(): param.requires_grad = True
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"PEFT 设置完成. 可训练参数: {trainable_params} ({trainable_params/sum(p.numel() for p in model.parameters())*100:.4f}%)")
@@ -185,38 +155,33 @@ def train(config: dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")
     
-    # 【v4.3 终极修复】将 Mamba 配置注入到 hps 中，通过 KModel 的构造函数传递
-    # 这是最干净、最稳定、最符合 OOP 的做法
-    hps = OmegaConf.load(hf_hub_download(repo_id=config['paths']['repo_id'], filename='config.json'))
+    # 【v4.5 终极修复】使用依赖注入，干净地构建模型
+    print("正在构建模型...")
+    repo_id = config['paths']['repo_id']
+    hps = OmegaConf.load(hf_hub_download(repo_id=repo_id, filename='config.json'))
+    
+    # 注入我们自己的配置
+    hps.repo_id = repo_id
+    hps.model_filename = "kokoro-v1_1-zh.pth" # 硬编码以匹配仓库
     hps.train.use_mamba = True
     hps.train.mamba_config = config['mamba']
-    model = KModel(hps=hps)
     
-    # 【v4.3 移除】所有在外部进行的、不稳定的模型修改操作都被废除
-    # old_encoder = model.predictor.text_encoder
-    # new_duration_encoder = DurationEncoder(
-    #     in_channels=old_encoder.in_channels,
-    #     filter_channels=old_encoder.filter_channels,
-    #     kernel_size=old_encoder.kernel_size,
-    #     p_dropout=old_encoder.p_dropout,
-    #     gin_channels=old_encoder.gin_channels,
-    #     use_mamba=True,
-    #     mamba_config=config['mamba']
-    # )
-    # # 把 TextEncoder 内部的 duration_encoder 替换掉
-    # model.predictor.text_encoder.duration_encoder = new_duration_encoder
+    model = KModel(hps=hps)
+    print("模型构建完毕。")
 
-    pipeline = KPipeline(lang_code='z', model=model, repo_id=config['paths']['repo_id'])
+    pipeline = KPipeline(lang_code='z', model=model, repo_id=repo_id)
     
     if config['paths']['load_mamba_from']:
         try:
-            # 【v4.3 升级】加载权重的目标现在是 TextEncoder 内部的 Mamba 模块
+            # 【v4.5】加载权重的目标现在是 TextEncoder 内部的 Mamba 模块
             mamba_weights = torch.load(config['paths']['load_mamba_from'], map_location=device)
             model.predictor.text_encoder.duration_predictor.load_state_dict(mamba_weights)
             print(f"Mamba 权重从 {config['paths']['load_mamba_from']} 加载成功！")
         except Exception as e:
             print(f"加载 Mamba 权重失败: {e}")
-    model = adapt_model_for_finetuning(model)
+
+    # 【v4.5 移除】adapt_model_for_finetuning 已被废除，其逻辑应在 KModel.forward_with_tokens 中正确实现
+    # model = adapt_model_for_finetuning(model)
     model = setup_peft(model)
     model.to(device)
     
@@ -326,9 +291,12 @@ def train(config: dict):
                         for i, sentence in enumerate(sentences_to_generate):
                             phonemes = pipeline.g2p(sentence)[0]
                             input_ids = torch.LongTensor([0, *list(filter(None, map(pipeline.model.vocab.get, phonemes))), 0]).unsqueeze(0).to(device)
-                            output_wav = model.forward_with_tokens(input_ids, fixed_ref_s)
+                            
+                            # 【v4.5】修正样本生成时的调用
+                            audio, _ = model.forward_with_tokens(input_ids, fixed_ref_s)
+                            
                             sample_path = sample_output_dir / f"epoch_{epoch+1}_sample_{i+1}.wav"
-                            torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
+                            torchaudio.save(sample_path, audio.cpu(), config['data']['target_sample_rate'])
 
             # 模式二：通才培养 (未指定参考音频)
             else:
@@ -346,9 +314,9 @@ def train(config: dict):
                     print("正在生成“随机靶”音频样本...")
                     with torch.no_grad():
                         # 只生成第一个样本以节省时间，但每次epoch的音色和文本是固定的（来自那个固定的batch）
-                        output_wav = model.forward_with_tokens(sample_input_ids[:1], sample_ref_s[:1])
+                        audio, _ = model.forward_with_tokens(sample_input_ids[:1], sample_ref_s[:1])
                         sample_path = sample_output_dir / f"epoch_{epoch+1}_random_sample.wav"
-                        torchaudio.save(sample_path, output_wav.cpu(), config['data']['target_sample_rate'])
+                        torchaudio.save(sample_path, audio.cpu(), config['data']['target_sample_rate'])
 
 
     dataloader = DataLoader(
