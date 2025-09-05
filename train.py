@@ -174,17 +174,6 @@ def setup_peft(model: KModel):
     return model
     
 def train(config: dict):
-    # 【v3.0】同时检查训练集和测试集的预处理目录
-    processed_train_path = Path(config['paths']['processed_data'])
-    processed_test_path = Path(config['paths']['processed_data_test'])
-    if not (processed_train_path.exists() and any(processed_train_path.iterdir())):
-        print("未找到预处理过的训练数据，开始生成...")
-        if not prepare_aishell3_dataset(config, 'train'): return
-    
-    if not (processed_test_path.exists() and any(processed_test_path.iterdir())):
-        print("未找到预处理过的测试数据，开始生成...")
-        if not prepare_aishell3_dataset(config, 'test'): return
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")
     
@@ -203,7 +192,17 @@ def train(config: dict):
     model.to(device)
     
     # 【核心修改】现在我们从重采样后的目录加载数据
-    final_data_path = config['paths']['processed_data_resampled']
+    final_data_path = Path(config['paths']['processed_data_resampled'])
+    if not final_data_path.exists() or not any(final_data_path.iterdir()):
+        print("="*50)
+        print(f"错误: 最终训练数据目录 '{final_data_path}' 为空或不存在。")
+        print("请按以下步骤操作:")
+        print("  1. 运行 `python train.py --config config.yaml --prepare-data-only` 来生成中间数据。")
+        print("  2. 运行 `python preprocess_audio.py --config config.yaml` 来对音频进行重采样。")
+        print("程序将终止。")
+        print("="*50)
+        return
+
     print(f"将从最终预处理目录加载训练数据: {final_data_path}")
     dataset = CustomAudioDataset(final_data_path, target_sr=config['data']['target_sample_rate'])
     
@@ -220,26 +219,30 @@ def train(config: dict):
         return
 
     # 【新增】加载验证集
-    final_test_data_path = config['paths']['processed_data_test_resampled']
-    print(f"将从最终预处理目录加载验证数据: {final_test_data_path}")
-    val_dataset = CustomAudioDataset(final_test_data_path, target_sr=config['data']['target_sample_rate'])
-    if len(val_dataset) == 0:
-        print(f"警告: 验证数据集为空，路径: {final_test_data_path}。将继续进行无验证的训练。")
+    final_test_data_path = Path(config['paths']['processed_data_test_resampled'])
+    if not final_test_data_path.exists() or not any(final_test_data_path.iterdir()):
+        print(f"警告: 最终验证数据目录 '{final_test_data_path}' 为空或不存在。将继续进行无验证的训练。")
         val_dataloader = None
     else:
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=config['training']['batch_size'], # 可以为验证集设置不同的 batch_size
-            shuffle=False,
-            collate_fn=collator,
-            num_workers=config['training']['num_workers'],
-            pin_memory=True
-        )
-        # 【新增】为验证音频样本准备固定数据
-        sample_generation_batch = next(iter(val_dataloader))
-        sample_output_dir = Path(config['paths']['output_dir']) / "samples"
-        sample_output_dir.mkdir(exist_ok=True, parents=True)
-        
+        print(f"将从最终预处理目录加载验证数据: {final_test_data_path}")
+        val_dataset = CustomAudioDataset(final_test_data_path, target_sr=config['data']['target_sample_rate'])
+        if len(val_dataset) == 0:
+            print(f"警告: 验证数据集为空，路径: {final_test_data_path}。将继续进行无验证的训练。")
+            val_dataloader = None
+        else:
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=config['training']['batch_size'], # 可以为验证集设置不同的 batch_size
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=config['training']['num_workers'],
+                pin_memory=True
+            )
+            # 【新增】为验证音频样本准备固定数据
+            sample_generation_batch = next(iter(val_dataloader))
+            sample_output_dir = Path(config['paths']['output_dir']) / "samples"
+            sample_output_dir.mkdir(exist_ok=True, parents=True)
+            
     collator = Collator(pipeline)
     dataloader = DataLoader(
         dataset, 
@@ -329,6 +332,7 @@ def train(config: dict):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="配置文件驱动的 Kokoro-Mamba PEFT 微调框架")
     parser.add_argument('--config', type=str, required=True, help='指向 config.yaml 文件的路径')
+    parser.add_argument('--prepare-data-only', action='store_true', help='如果设置，则只运行数据准备步骤然后退出')
     args = parser.parse_args()
     
     try:
@@ -337,5 +341,12 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print(f"错误: 找不到配置文件: {args.config}")
         exit(1)
+
+    if args.prepare_data_only:
+        print("模式: 仅准备数据...")
+        prepare_aishell3_dataset(config, 'train')
+        prepare_aishell3_dataset(config, 'test')
+        print("数据准备完成。")
+        exit(0)
         
     train(config)
