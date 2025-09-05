@@ -19,5 +19,8 @@ logger.add(
 # Disable before release or as needed
 logger.disable("kokoro")
 
-from .model import KModel
-from .pipeline import KPipeline
+# 【v4.6 终极循环导入修复】删除下面这两行。
+# 它们试图在包的初始化阶段就去加载 model 和 pipeline，
+# 而 model 又依赖包内的其他模块，导致了致命的循环导入。
+# from .model import KModel
+# from .pipeline import KPipeline
