@@ -9,6 +9,47 @@ import torch.nn.functional as F
 from torch.nn import Conv1d, Embedding, Linear, ModuleList
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from mamba_ssm import Mamba
+import math
+import torch
+from torch import nn
+from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
+from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+from kokoro import commons
+from kokoro import attentions
+
+
+# 【v4.4 终极修复】恢复被意外删除的 DurationEncoder 类
+class DurationEncoder(nn.Module):
+    def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.filter_channels = filter_channels
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.gin_channels = gin_channels
+
+        self.drop = nn.Dropout(p_dropout)
+        self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size//2)
+        self.norm_1 = attentions.LayerNorm(filter_channels)
+        self.conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size//2)
+        self.norm_2 = attentions.LayerNorm(filter_channels)
+        self.proj = nn.Conv1d(filter_channels, 1, 1)
+
+    def forward(self, x, x_mask, g=None):
+        x = torch.detach(x)
+        if g is not None:
+            g = torch.detach(g)
+            x = x + g
+        x = self.conv_1(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_1(x)
+        x = self.drop(x)
+        x = self.conv_2(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_2(x)
+        x = self.drop(x)
+        x = self.proj(x * x_mask)
+        return x * x_mask
 
 
 class LinearNorm(nn.Module):
@@ -81,13 +122,16 @@ class TextEncoder(nn.Module):
             print("TextEncoder 正在使用 Mamba 模块进行韵律预测。")
             if mamba_config is None:
                 raise ValueError("Mamba config must be provided when use_mamba is True.")
-            # Mamba 模块需要拼接 style vector
+            
+            d_mamba_model = hidden_channels + gin_channels
             self.duration_predictor = Mamba(
-                d_model=hidden_channels + gin_channels,
+                d_model=d_mamba_model,
                 d_state=mamba_config['d_state'],
                 d_conv=mamba_config['d_conv'],
                 expand=mamba_config['expand']
             )
+            # 【v4.5 终极修复】为 Mamba 的高维输出增加一个线性投影层，以降维到1
+            self.mamba_proj = nn.Linear(d_mamba_model, 1)
         else:
             print("TextEncoder 正在使用 LSTM 模块进行韵律预测。")
             self.duration_predictor = DurationEncoder(
@@ -114,10 +158,13 @@ class TextEncoder(nn.Module):
                 x_dp = torch.cat([x_dp, style_expanded], dim=-1)
             
             x_dp.masked_fill_(x_mask.transpose(1, 2) == 0, 0.0)
-            logw = self.duration_predictor(x_dp).transpose(1, 2) # 输出转回 (B, 1, L)
-            logw = logw.squeeze(1) # 移除维度
+            
+            # 【v4.5 终极修复】使用 mamba_proj 进行降维打击
+            mamba_out = self.duration_predictor(x_dp) # 输出是 (B, L, D)
+            logw = self.mamba_proj(mamba_out).squeeze(-1) # 降维到 (B, L, 1) 再 squeeze 成 (B, L)
         else:
-            logw = self.duration_predictor(x_dp, x_mask, g=g_dp)
+            # DurationEncoder 内部已经包含了 proj 层，所以它的输出已经是 (B, 1, L)
+            logw = self.duration_predictor(x_dp, x_mask, g=g_dp).squeeze(1)
 
         stats = self.proj(x * x_mask)
         m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -166,7 +213,7 @@ class ProsodyPredictor(nn.Module):
         self.duration_proj = nn.Linear(d_hid, 1)
 
     def forward(self, x, s, text_lengths, m):
-        m, logs, logw, x_mask = self.text_encoder(x, text_lengths, g=s)
+        m, logs, duration, x_mask = self.text_encoder(x, text_lengths, g=s)
         # some legacy code
         x = m.transpose(1, 2)
         x, _ = self.lstm(x)
