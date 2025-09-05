@@ -10,6 +10,8 @@ from pathlib import Path
 from tqdm import tqdm
 import shutil
 import random
+from omegaconf import OmegaConf
+from huggingface_hub import hf_hub_download
 
 # --- 导入 Kokoro 核心组件 ---
 from kokoro.model import KModel
@@ -173,7 +175,8 @@ def adapt_model_for_finetuning(model: KModel):
 
 def setup_peft(model: KModel):
     for param in model.parameters(): param.requires_grad = False
-    for param in model.predictor.text_encoder.duration_encoder.mamba.parameters(): param.requires_grad = True
+    # 【v4.3 升级】PEFT 的目标现在是 TextEncoder 内部的 Mamba 模块
+    for param in model.predictor.text_encoder.duration_predictor.parameters(): param.requires_grad = True
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"PEFT 设置完成. 可训练参数: {trainable_params} ({trainable_params/sum(p.numel() for p in model.parameters())*100:.4f}%)")
     return model
@@ -182,33 +185,34 @@ def train(config: dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}, AMP: {'启用' if config['training']['use_amp'] else '禁用'}")
     
-    model = KModel(repo_id=config['paths']['repo_id'])
-
-    # 【v4.2 升级】直接在模型初始化后，用我们新的、经过基因改造的 DurationEncoder 替换掉旧的
-    # 这种做法比“猴子补丁”更干净、更稳定、更易于理解
-    old_encoder = model.predictor.text_encoder
-    new_duration_encoder = DurationEncoder(
-        in_channels=old_encoder.in_channels,
-        filter_channels=old_encoder.filter_channels,
-        kernel_size=old_encoder.kernel_size,
-        p_dropout=old_encoder.p_dropout,
-        gin_channels=old_encoder.gin_channels,
-        use_mamba=True,
-        mamba_config=config['mamba']
-    )
-    # 把 TextEncoder 内部的 duration_encoder 替换掉
-    model.predictor.text_encoder.duration_encoder = new_duration_encoder
+    # 【v4.3 终极修复】将 Mamba 配置注入到 hps 中，通过 KModel 的构造函数传递
+    # 这是最干净、最稳定、最符合 OOP 的做法
+    hps = OmegaConf.load(hf_hub_download(repo_id=config['paths']['repo_id'], filename='config.json'))
+    hps.train.use_mamba = True
+    hps.train.mamba_config = config['mamba']
+    model = KModel(hps=hps)
+    
+    # 【v4.3 移除】所有在外部进行的、不稳定的模型修改操作都被废除
+    # old_encoder = model.predictor.text_encoder
+    # new_duration_encoder = DurationEncoder(
+    #     in_channels=old_encoder.in_channels,
+    #     filter_channels=old_encoder.filter_channels,
+    #     kernel_size=old_encoder.kernel_size,
+    #     p_dropout=old_encoder.p_dropout,
+    #     gin_channels=old_encoder.gin_channels,
+    #     use_mamba=True,
+    #     mamba_config=config['mamba']
+    # )
+    # # 把 TextEncoder 内部的 duration_encoder 替换掉
+    # model.predictor.text_encoder.duration_encoder = new_duration_encoder
 
     pipeline = KPipeline(lang_code='z', model=model, repo_id=config['paths']['repo_id'])
     
-    # 【v4.2 移除】猴子补丁函数已被删除
-    # model.predictor.text_encoder = replace_lstm_with_mamba_in_durationencoder(model.predictor.text_encoder, config['mamba'])
-    
     if config['paths']['load_mamba_from']:
         try:
-            # 【v4.2 升级】现在我们加载权重的目标更明确了
+            # 【v4.3 升级】加载权重的目标现在是 TextEncoder 内部的 Mamba 模块
             mamba_weights = torch.load(config['paths']['load_mamba_from'], map_location=device)
-            model.predictor.text_encoder.duration_encoder.mamba.load_state_dict(mamba_weights)
+            model.predictor.text_encoder.duration_predictor.load_state_dict(mamba_weights)
             print(f"Mamba 权重从 {config['paths']['load_mamba_from']} 加载成功！")
         except Exception as e:
             print(f"加载 Mamba 权重失败: {e}")
@@ -412,6 +416,15 @@ def train(config: dict):
 
         # 【v4.2 升级】保存完整的检查点
         if (epoch + 1) % config['training']['save_every_n_epochs'] == 0:
+            # 【v4.3 新增】除了保存完整的检查点，我们额外单独保存一份 Mamba 权重
+            # 这对于第二阶段训练更方便
+            output_path = Path(config['paths']['output_dir'])
+            output_path.mkdir(exist_ok=True)
+            mamba_weights = model.predictor.text_encoder.duration_predictor.state_dict()
+            save_path = output_path / f"mamba_peft_epoch_{epoch+1}.pth"
+            torch.save(mamba_weights, save_path)
+            print(f"Mamba 模块权重已单独保存至: {save_path}")
+
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pth"
             print(f"正在保存检查点至 {checkpoint_path}...")
             torch.save({

@@ -53,7 +53,8 @@ class KModel(torch.nn.Module):
         self.context_length = self.bert.config.max_position_embeddings
         self.predictor = ProsodyPredictor(
             style_dim=config['style_dim'], d_hid=config['hidden_dim'],
-            nlayers=config['n_layer'], max_dur=config['max_dur'], dropout=config['dropout']
+            nlayers=config['n_layer'], max_dur=config['max_dur'], dropout=config['dropout'],
+            use_mamba=config['use_mamba'], mamba_config=config['mamba_config']
         )
         self.text_encoder = TextEncoder(
             channels=config['hidden_dim'], kernel_size=config['text_encoder_kernel_size'],

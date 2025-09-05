@@ -36,40 +36,93 @@ class LayerNorm(nn.Module):
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, channels, kernel_size, depth, n_symbols, actv=nn.LeakyReLU(0.2)):
+    def __init__(self,
+                 n_vocab,
+                 in_channels,
+                 out_channels,
+                 hidden_channels,
+                 filter_channels,
+                 n_heads,
+                 n_layers,
+                 kernel_size,
+                 p_dropout,
+                 gin_channels=0,
+                 use_mamba=False,  # 【v4.3 核心改造】
+                 mamba_config=None # 【v4.3 核心改造】
+                 ):
         super().__init__()
-        self.embedding = nn.Embedding(n_symbols, channels)
-        padding = (kernel_size - 1) // 2
-        self.cnn = nn.ModuleList()
-        for _ in range(depth):
-            self.cnn.append(nn.Sequential(
-                weight_norm(nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)),
-                LayerNorm(channels),
-                actv,
-                nn.Dropout(0.2),
-            ))
-        self.lstm = nn.LSTM(channels, channels//2, 1, batch_first=True, bidirectional=True)
+        self.n_vocab = n_vocab
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.gin_channels = gin_channels
+        self.use_mamba = use_mamba
 
-    def forward(self, x, input_lengths, m):
-        x = self.embedding(x)  # [B, T, emb]
-        x = x.transpose(1, 2)  # [B, emb, T]
-        m = m.unsqueeze(1)
-        x.masked_fill_(m, 0.0)
-        for c in self.cnn:
-            x = c(x)
-            x.masked_fill_(m, 0.0)
-        x = x.transpose(1, 2)  # [B, T, chn]
-        lengths = input_lengths if input_lengths.device == torch.device('cpu') else input_lengths.to('cpu')
-        x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x = x.transpose(-1, -2)
-        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)
-        x_pad[:, :, :x.shape[-1]] = x
-        x = x_pad
-        x.masked_fill_(m, 0.0)
-        return x
+        self.emb = nn.Embedding(n_vocab, in_channels)
+        nn.init.normal_(self.emb.weight, 0.0, in_channels**-0.5)
+
+        self.encoder = attentions.Encoder(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            p_dropout,
+            gin_channels=self.gin_channels)
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+        
+        # 【v4.3 核心改造】在这里进行器官移植
+        if self.use_mamba:
+            print("TextEncoder 正在使用 Mamba 模块进行韵律预测。")
+            if mamba_config is None:
+                raise ValueError("Mamba config must be provided when use_mamba is True.")
+            # Mamba 模块需要拼接 style vector
+            self.duration_predictor = Mamba(
+                d_model=hidden_channels + gin_channels,
+                d_state=mamba_config['d_state'],
+                d_conv=mamba_config['d_conv'],
+                expand=mamba_config['expand']
+            )
+        else:
+            print("TextEncoder 正在使用 LSTM 模块进行韵律预测。")
+            self.duration_predictor = DurationEncoder(
+                hidden_channels, filter_channels, kernel_size, p_dropout, gin_channels=gin_channels)
+
+    def forward(self, x, x_lengths, g=None):
+        x = self.emb(x) * math.sqrt(self.in_channels)  # [b, t, h]
+        x = x.transpose(1, -1)  # [b, h, t]
+        x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+
+        x = self.encoder(x * x_mask, x_mask, g=g)
+        
+        # 准备送入韵律预测模块的数据
+        x_dp = x
+        if g is not None:
+            g_dp = g.clone()
+
+        # 【v4.3 核心改造】根据模式选择不同的路径
+        if self.use_mamba:
+            # Mamba 需要 (B, L, D) 格式
+            x_dp = x_dp.transpose(1, 2)
+            if g is not None:
+                style_expanded = g_dp.transpose(1, 2).expand(-1, x_dp.size(1), -1)
+                x_dp = torch.cat([x_dp, style_expanded], dim=-1)
+            
+            x_dp.masked_fill_(x_mask.transpose(1, 2) == 0, 0.0)
+            logw = self.duration_predictor(x_dp).transpose(1, 2) # 输出转回 (B, 1, L)
+            logw = logw.squeeze(1) # 移除维度
+        else:
+            logw = self.duration_predictor(x_dp, x_mask, g=g_dp)
+
+        stats = self.proj(x * x_mask)
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        
+        return m, logs, logw, x_mask
 
 
 class AdaLayerNorm(nn.Module):
@@ -92,115 +145,34 @@ class AdaLayerNorm(nn.Module):
 
 
 class ProsodyPredictor(nn.Module):
-    def __init__(self, style_dim, d_hid, nlayers, max_dur=50, dropout=0.1):
+    def __init__(self, d_model, d_hid, nlayers, dropout=0.1, style_dim=128, use_mamba=False, mamba_config=None):
         super().__init__()
-        self.text_encoder = DurationEncoder(sty_dim=style_dim, d_model=d_hid,nlayers=nlayers, dropout=dropout)
-        self.lstm = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
-        self.duration_proj = LinearNorm(d_hid, max_dur)
-        self.shared = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
-        self.F0 = nn.ModuleList()
-        self.F0.append(AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout))
-        self.F0.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout))
-        self.F0.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout))
-        self.N = nn.ModuleList()
-        self.N.append(AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout))
-        self.N.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout))
-        self.N.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout))
-        self.F0_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
-        self.N_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
+        self.text_encoder = TextEncoder(
+            n_vocab=35, 
+            in_channels=d_model, 
+            out_channels=d_model, 
+            hidden_channels=d_hid, 
+            filter_channels=d_hid*4, 
+            n_heads=2, 
+            n_layers=4, 
+            kernel_size=5, 
+            p_dropout=0.1, 
+            gin_channels=style_dim,
+            use_mamba=use_mamba,
+            mamba_config=mamba_config
+        )
+        self.F0Ntrain = F0Network_N(d_model=d_hid, out_dim=2, nlayers=nlayers, dropout=dropout, style_dim=style_dim)
+        self.lstm = nn.LSTM(d_hid, d_hid//2, num_layers=1, batch_first=True, bidirectional=True)
+        self.duration_proj = nn.Linear(d_hid, 1)
 
-    def forward(self, texts, style, text_lengths, alignment, m):
-        d = self.text_encoder(texts, style, text_lengths, m)
-        m = m.unsqueeze(1)
-        lengths = text_lengths if text_lengths.device == torch.device('cpu') else text_lengths.to('cpu')
-        x = nn.utils.rnn.pack_padded_sequence(d, lengths, batch_first=True, enforce_sorted=False)
-        self.lstm.flatten_parameters()
+    def forward(self, x, s, text_lengths, m):
+        m, logs, logw, x_mask = self.text_encoder(x, text_lengths, g=s)
+        # some legacy code
+        x = m.transpose(1, 2)
         x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x_pad = torch.zeros([x.shape[0], m.shape[-1], x.shape[-1]], device=x.device)
-        x_pad[:, :x.shape[1], :] = x
-        x = x_pad
-        duration = self.duration_proj(nn.functional.dropout(x, 0.5, training=False))
-        en = (d.transpose(-1, -2) @ alignment)
-        return duration.squeeze(-1), en
-
-    def F0Ntrain(self, x, s):
-        x, _ = self.shared(x.transpose(-1, -2))
-        F0 = x.transpose(-1, -2)
-        for block in self.F0:
-            F0 = block(F0, s)
-        F0 = self.F0_proj(F0)
-        N = x.transpose(-1, -2)
-        for block in self.N:
-            N = block(N, s)
-        N = self.N_proj(N)
-        return F0.squeeze(1), N.squeeze(1)
-
-
-class DurationEncoder(nn.Module):
-    def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0, use_mamba=False, mamba_config=None):
-        super().__init__()
-        self.in_channels = in_channels
-        self.filter_channels = filter_channels
-        self.kernel_size = kernel_size
-        self.p_dropout = p_dropout
-        self.gin_channels = gin_channels
-
-        self.drop = nn.Dropout(p_dropout)
-        self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size//2)
-        self.norm_1 = attentions.LayerNorm(filter_channels)
-        self.conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size//2)
-        self.norm_2 = attentions.LayerNorm(filter_channels)
-        self.proj = nn.Conv1d(filter_channels, 1, 1)
-
-        self.use_mamba = use_mamba
-        if use_mamba:
-            if mamba_config is None:
-                raise ValueError("Mamba config must be provided when use_mamba is True.")
-            # Mamba 模块的输入维度是 d_model，这里等于 in_channels
-            # 我们需要将风格向量 gin (sty_dim) 和文本向量 (d_model) 拼接起来
-            self.mamba = Mamba(
-                d_model=in_channels + gin_channels,
-                d_state=mamba_config['d_state'],
-                d_conv=mamba_config['d_conv'],
-                expand=mamba_config['expand']
-            )
-        else:
-            self.lstm = nn.LSTM(in_channels, filter_channels//2, 1, batch_first=True, bidirectional=True)
-
-    def forward(self, x, x_mask, g=None):
-        x = torch.detach(x)
-        if g is not None:
-            g = torch.detach(g)
-            x = x + g
-        x = self.conv_1(x * x_mask)
-        x = torch.relu(x)
-        x = self.norm_1(x)
-        x = self.drop(x)
-        x = self.conv_2(x * x_mask)
-        x = torch.relu(x)
-        x = self.norm_2(x)
-        x = self.drop(x)
-        
-        if self.use_mamba:
-            # Mamba 需要 (B, L, D) 的输入格式
-            mamba_input = x.transpose(1, 2)
-            if g is not None:
-                # 将 style 向量在长度维度上扩展并拼接
-                style_expanded = g.transpose(1, 2).expand(-1, mamba_input.size(1), -1)
-                mamba_input = torch.cat([mamba_input, style_expanded], dim=-1)
-            
-            mamba_input.masked_fill_(x_mask.transpose(1, 2) == 0, 0.0)
-            x = self.mamba(mamba_input) # Mamba 输出也是 (B, L, D)
-            x = x.transpose(1, 2) # 转回 (B, D, L)
-        else:
-            x = x.transpose(1, 2)
-            # go through an LSTM
-            x, _ = self.lstm(x)
-            x = x.transpose(1, 2)
-
-        x = self.proj(x * x_mask)
-        return x * x_mask
+        x = x.transpose(1, 2)
+        duration = self.duration_proj(x.transpose(1, 2)).squeeze(-1)
+        return m, logs, duration, x_mask
 
 
 # https://github.com/yl4579/StyleTTS2/blob/main/Utils/PLBERT/util.py

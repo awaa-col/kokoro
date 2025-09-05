@@ -1,49 +1,85 @@
-# ================================================================
-# Kokoro-Mamba Pro PEFT 项目 - 最终配置文件 (v2.0)
-# ================================================================
-# 这是最终的、与 train.py 完全同步的配置文件。
+# ======================================================================
+# Kokoro-Mamba Pro PEFT 项目 - 最终配置文件 (v4.3)
+# Masker 终极重构版 - 包含清晰的两阶段训练指导和健壮的检查点系统
+# ======================================================================
 
 # --- 1. 路径配置 (Paths) ---
+# 这是整个项目的核心配置区域，请仔细填写。
 paths:
+  # 预训练模型的 Hugging Face 仓库 ID
   repo_id: "hexgrad/Kokoro-82M-v1.1-zh"
-  # 【重要】这里现在指向你完整解压后的 AISHELL-3 train 文件夹
-  aishell3_unzipped_train_dir: "/content/kokoro/trains/train"
-  # 【新增】指向 AISHELL-3 test 文件夹
+  
+  # --- 【第一阶段：通才培养 - 使用 AISHELL-3】 ---
+  # 【!! 必须修改 !-】 指向 AISHELL-3 train 文件夹的完整路径
+  # (必须是直接包含 content.txt 和 wav/ 的那个目录)
+  aishell3_unzipped_train_dir: "/content/kokoro/trains/train" 
+  
+  # 【!! 必须修改 !-】 指向 AISHELL-3 test 文件夹的完整路径
   aishell3_unzipped_test_dir: "/content/kokoro/trains/test"
 
-  # 预处理后的数据存放位置
-  processed_data: "./AISHELL-3-processed/train"
-  # 【新增】测试集的预处理数据存放位置
-  processed_data_test: "./AISHELL-3-processed/test"
-
-  # 【新增】经过重采样后的、最终用于训练的数据存放位置
-  processed_data_resampled: "./AISHELL-3-processed-24k/train"
-  # 【新增】经过重采样后的、最终用于验证的数据存放位置
-  processed_data_test_resampled: "./AISHELL-3-processed-24k/test"
-
-  # 模型权重输出目录
-  output_dir: "./kokoro_finetuned_model_4070L"
-  # (可选) 第二阶段微调时，加载第一阶段的 Mamba 权重
+  # --- 【第二阶段：专才培养 - 使用你自己的数据】 ---
+  # 在进入第二阶段时，你需要将上面的 train/test 路径修改为你自己的数据集路径。
+  # 同时，你需要配置下面的参数来加载第一阶段的成果：
+  #
+  # (可选) 加载第一阶段训练好的 Mamba 权重，开启第二阶段训练
+  # 例如: "./kokoro_finetuned_model/mamba_peft_epoch_50.pth"
   load_mamba_from: null
 
-# --- 2. 数据处理配置 (Data Processing) ---
+  # --- [自动生成路径，通常无需修改] ---
+  # 中间数据和最终数据的存放位置，脚本会自动创建这些目录
+  processed_data: "./AISHELL-3-processed/train"
+  processed_data_test: "./AISHELL-3-processed/test"
+  processed_data_resampled: "./AISHELL-3-processed-24k/train"
+  processed_data_test_resampled: "./AISHELL-3-processed-24k/test"
+
+  # --- [模型与样本输出路径] ---
+  # 生成的音频样本和单独保存的 Mamba 权重会保存在这里
+  output_dir: "./output"
+
+  # --- [检查点（Checkpoint）路径] ---
+  # 用于实现“断点续训”的完整训练状态会保存在这里
+  checkpoint_dir: "./checkpoints"
+
+# --- 2. 数据配置 (Data) ---
 data:
-  # 使用 100% 的全量数据
-  sampling_ratio: 1.0 # (此参数在当前模式下无效，但保留)
+  # 目标采样率，必须与预训练模型匹配
   target_sample_rate: 24000
 
 # --- 3. 训练配置 (Training) ---
 training:
-  # 4070 Laptop 8G 显存的保守设置
   batch_size: 4
   epochs: 50
   learning_rate: 1e-4
-  use_amp: true
-  save_every_n_epochs: 5
-  num_workers: 4
+  use_amp: true         # 混合精度训练，在兼容的 GPU 上可以加速并减少显存占用
+  save_every_n_epochs: 5 # 每隔多少个 epoch 保存一次检查点和 Mamba 权重
+  num_workers: 2        # 数据加载器的工作线程数，根据你的 CPU 和内存调整
 
 # --- 4. Mamba 模型配置 (Mamba Model) ---
+# 这些是 Mamba 模块的超参数，通常无需修改
 mamba:
   d_state: 16
   d_conv: 4
   expand: 2
+
+# --- 5. 专业级验证配置 (Evaluation) ---
+# 这是控制我们“智能验证引擎”的核心
+evaluation:
+  # 在验证时，可以设置更大的 batch_size 以加快速度
+  batch_size: 8 
+  
+  # --- 【!! 核心模式开关 !!】 ---
+  # 通过这个参数，可以切换“通才”和“专才”两种验证模式
+  #
+  # 模式一: 通才培养 (Generalist Training) -> 将此项留空 ("")
+  #          脚本会从验证集随机抽取音色来生成样本，用于评估模型的通用韵律表现。
+  #
+  # 模式二: 专才培养 (Specialist Training) -> 将此项设置为一个 .wav 文件路径
+  #          脚本会始终使用这个固定音色来生成样本，用于评估音色克隆的效果。
+  # 例如: "./my_dataset/wav/speaker_01/001.wav"
+  reference_wav_path: ""
+
+  # 在“专才模式”下，你可以指定一组固定的句子，用于精准评估
+  sentences_to_generate:
+    - "你好，欢迎使用由 Masker 终极重构的 Kokoro 语音合成引擎。"
+    - "这是一个包含了复杂韵律和停顿的长句子，专门用来测试模型的表现。"
+    - "春江潮水连海平，海上明月共潮生。"
