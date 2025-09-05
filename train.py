@@ -51,16 +51,17 @@ def prepare_aishell3_dataset(config: dict, split: str):
     with open(content_path, 'r', encoding='utf-8') as f:
         for line in f:
             try:
-                # AISHELL-3 test set content.txt has a different format
-                if split == 'test':
-                    parts = line.strip().split()
-                    wav_name = parts[0]
-                    text = " ".join(parts[1:])
-                else:
-                    wav_name, text, _ = line.strip().split('|', 2)
+                # 【v3.1 修复】统一使用空格分割的解析逻辑，因为它已被证明对 test 集有效。
+                # 之前的 | 分割逻辑是错误的，导致 train 集加载失败。
+                parts = line.strip().split()
+                if len(parts) < 2:  # 至少要有一个文件名和一个字
+                    continue
+                
+                wav_name = parts[0]
+                text = " ".join(parts[1:])
                 
                 transcript_dict[wav_name.strip()] = text.strip()
-            except ValueError: continue
+            except Exception: continue
     
     print(f"标注文件加载完毕，共 {len(transcript_dict)} 条记录。")
 
